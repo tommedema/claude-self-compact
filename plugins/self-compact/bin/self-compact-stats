@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""self-compact-stats: cost and context statistics of a Claude Code session transcript.
+
+Usage: self-compact-stats [options] [TRANSCRIPT.jsonl | SESSION_ID]
+
+Without an argument it reads the newest transcript of the current directory's
+project. Prices are dollars per million tokens. Reads only local files.
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import statistics
+import sys
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="self-compact-stats", description=__doc__.split("\n")[0])
+    p.add_argument("target", nargs="?", help="transcript .jsonl path or session id (default: newest in this project)")
+    p.add_argument("--price-output", type=float, default=40.0, help="output tokens, $/M (default 40)")
+    p.add_argument("--price-write", type=float, default=16.0, help="1-hour cache write, $/M (default 16)")
+    p.add_argument("--price-write-5m", type=float, default=10.0, help="5-minute cache write, $/M (default 10)")
+    p.add_argument("--price-read", type=float, default=0.20, help="cache read, $/M (default 0.20)")
+    p.add_argument("--price-input", type=float, default=8.0, help="uncached input, $/M (default 8)")
+    p.add_argument("--compaction-cost", type=float, help="dollars per compaction for the threshold search (default: measured)")
+    p.add_argument("--post", type=int, help="context right after a compaction, tokens (default: measured, else 50000)")
+    p.add_argument("--window", type=int, help="auto-compaction point for the 'none' row (default: largest seen, at least 950000)")
+    p.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    return p.parse_args(argv)
+
+
+def config_dir():
+    return os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+
+
+def resolve(target):
+    projects = os.path.join(config_dir(), "projects")
+    if target and os.path.isfile(target):
+        return target
+    if target:
+        hits = glob.glob(os.path.join(projects, "*", target + "*.jsonl"))
+        if hits:
+            return max(hits, key=os.path.getmtime)
+        sys.exit("self-compact-stats: no transcript found for %r" % target)
+    cwd = os.getcwd()
+    slug = "".join(c if c.isalnum() else "-" for c in cwd)
+    hits = glob.glob(os.path.join(projects, slug, "*.jsonl"))
+    if not hits:
+        sys.exit("self-compact-stats: no transcripts for %s; pass a path or session id" % cwd)
+    return max(hits, key=os.path.getmtime)
+
+
+def load(path):
+    """Main-conversation calls (deduplicated by message id) and compaction boundaries, in order."""
+    calls, order, events = {}, [], []
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if '"assistant"' not in line and '"compact_boundary"' not in line and '"isCompactSummary"' not in line:
+                continue
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("isSidechain"):
+                continue
+            if r.get("type") == "system" and r.get("subtype") == "compact_boundary":
+                m = r.get("compactMetadata") or {}
+                events.append(("compact", {"trigger": m.get("trigger"), "pre": m.get("preTokens"), "post": m.get("postTokens"), "at": r.get("timestamp")}))
+                continue
+            if r.get("isCompactSummary"):
+                c = r.get("message", {}).get("content")
+                if events and events[-1][0] == "compact":
+                    events[-1][1]["summary_chars"] = len(c if isinstance(c, str) else json.dumps(c))
+                continue
+            if r.get("type") != "assistant":
+                continue
+            msg = r.get("message") or {}
+            u = msg.get("usage")
+            if not u or msg.get("model") == "<synthetic>":
+                continue
+            mid = msg.get("id") or r.get("requestId") or r.get("uuid")
+            cc = u.get("cache_creation") or {}
+            rec = {
+                "at": r.get("timestamp"),
+                "in": u.get("input_tokens") or 0,
+                "cr": u.get("cache_read_input_tokens") or 0,
+                "cw": u.get("cache_creation_input_tokens") or 0,
+                "cw5": cc.get("ephemeral_5m_input_tokens"),
+                "cw1": cc.get("ephemeral_1h_input_tokens"),
+                "out": u.get("output_tokens") or 0,
+            }
+            if mid in calls:
+                old = calls[mid]
+                old["out"] = max(old["out"], rec["out"])
+                continue
+            calls[mid] = rec
+            order.append(mid)
+            events.append(("call", rec))
+    return events
+
+
+def write_cost(c, P):
+    if c["cw5"] is not None or c["cw1"] is not None:
+        return (c["cw1"] or 0) * P["w1"] + (c["cw5"] or 0) * P["w5"]
+    return c["cw"] * P["w1"]
+
+
+def pct(xs, q):
+    if not xs:
+        return 0
+    xs = sorted(xs)
+    k = (len(xs) - 1) * q
+    lo, hi = int(math.floor(k)), int(math.ceil(k))
+    return xs[lo] + (xs[hi] - xs[lo]) * (k - lo)
+
+
+def plugin_log(session_path):
+    """Summariser usage the self-compact plugin recorded for this session, by finish time."""
+    path = os.path.join(config_dir(), "self-compact", "compactions.jsonl")
+    out = []
+    if not os.path.isfile(path):
+        return out
+    sid = os.path.splitext(os.path.basename(session_path))[0]
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("sessionId") == sid and e.get("ok") and e.get("usage"):
+                out.append(e)
+    return out
+
+
+def k(n):
+    return "%dK" % round(n / 1000) if abs(n) >= 1000 else "%d" % n
+
+
+def main(argv):
+    a = parse_args(argv)
+    P = {"out": a.price_output / 1e6, "w1": a.price_write / 1e6, "w5": a.price_write_5m / 1e6, "read": a.price_read / 1e6, "in": a.price_input / 1e6}
+    path = resolve(a.target)
+    events = load(path)
+    calls = [e[1] for e in events if e[0] == "call"]
+    if not calls:
+        sys.exit("self-compact-stats: no model calls in %s" % path)
+
+    # Cost split.
+    out_cost = sum(c["out"] for c in calls) * P["out"]
+    first_cost = sum(write_cost(c, P) + c["in"] * P["in"] for c in calls)
+    reread_cost = sum(c["cr"] for c in calls) * P["read"]
+    total = out_cost + first_cost + reread_cost
+
+    # Segments between compactions; context per call; growth; cache misses.
+    segs, cur, comps = [], [], []
+    for kind, v in events:
+        if kind == "compact":
+            comps.append(v)
+            if cur:
+                segs.append(cur)
+            cur = []
+        else:
+            v["after_compact"] = not cur and bool(comps)
+            cur.append(v)
+    if cur:
+        segs.append(cur)
+    ctx = [c["in"] + c["cr"] + c["cw"] for c in calls]
+    for c in calls:
+        c["ctx"] = c["in"] + c["cr"] + c["cw"]
+    deltas, misses, miss_cost = [], 0, 0.0
+    for s in segs:
+        for prev, c in zip(s, s[1:]):
+            deltas.append(c["ctx"] - prev["ctx"])
+            c["miss"] = c["cr"] < 0.5 * prev["ctx"] and prev["ctx"] > 20000
+            if c["miss"]:
+                misses += 1
+                miss_cost += write_cost(c, P)
+    growth = statistics.mean(deltas) if deltas else 0.0
+    growth_med = statistics.median(deltas) if deltas else 0.0
+    steady_write = statistics.median([c["cw"] for s in segs for c in s[1:]] or [0])
+
+    # Compactions: context right after, and what one costs.
+    firsts = [s[0] for s in segs if s[0].get("after_compact")]
+    post = a.post or (int(statistics.median([c["ctx"] for c in firsts])) if firsts else 50000)
+    logged = plugin_log(path)
+    per = []
+    for i, v in enumerate(comps):
+        first = next((s[0] for s in segs if s[0].get("after_compact") and s[0]["at"] and v["at"] and s[0]["at"] >= v["at"]), None)
+        recache = max(0.0, write_cost(first, P) - steady_write * P["w1"]) if first else 0.0
+        summ = None
+        for e in logged:
+            if v["at"] and e.get("at", "") >= v["at"]:
+                u = e["usage"]
+                summ = (u.get("input_tokens", 0) * P["in"] + u.get("cache_read_input_tokens", 0) * P["read"]
+                        + u.get("cache_creation_input_tokens", 0) * P["w1"] + u.get("output_tokens", 0) * P["out"])
+                v["measured"] = True
+                break
+        if summ is None:
+            # Not logged: the summariser reads the context once and writes the summary
+            # (about 3.5 characters per token, doubled for its thinking).
+            summ = (v.get("pre") or 0) * P["read"] + 2 * (v.get("summary_chars") or 16000) / 3.5 * P["out"]
+        per.append({"summariser": summ, "recache": recache, "total": summ + recache, "measured": bool(v.get("measured"))})
+    K = a.compaction_cost if a.compaction_cost is not None else (statistics.median([p["total"] for p in per]) if per else 1.0)
+    K_src = "given" if a.compaction_cost is not None else ("measured median" if per else "assumed")
+
+    # Threshold search: replay this session's calls with compaction at threshold T.
+    seq = []
+    for s in segs:
+        for i, c in enumerate(s):
+            if i == 0:
+                n = 0 if c.get("after_compact") else c["ctx"]
+            else:
+                n = max(0, c["ctx"] - s[i - 1]["ctx"])
+            seq.append((n, c.get("miss", False), bool(c.get("after_compact")) and i == 0))
+    start = calls[0]["ctx"]
+    window = a.window or max(950000, max(ctx))
+
+    def replay(T, actual=False):
+        # Re-read the context before each call (re-written instead on a cache miss),
+        # write the call's new tokens, and compact at T (or where it really happened).
+        cur, cost, n_comp = 0, 0.0, 0
+        for i, (n, miss, compacted_before) in enumerate(seq):
+            if actual and compacted_before:
+                cost += K
+                n_comp += 1
+                cur = post
+            base = cur if i else 0
+            cost += base * (P["w1"] if miss else P["read"]) + n * P["w1"]
+            cur = base + n if i else start
+            if not actual and cur >= T:
+                cost += K
+                n_comp += 1
+                cur = post
+        return cost, n_comp
+
+    fixed = out_cost  # the same whatever the threshold
+    model_actual = replay(None, actual=True)[0] + fixed
+    rows = []
+    for T in [100000, 150000, 200000, 250000, 300000, 400000, 500000, 700000]:
+        if T < window:
+            c, n = replay(T)
+            rows.append((T, n, c + fixed))
+    none_cost, none_n = replay(window)
+    best_T, best_cost, best_n = None, None, None
+    T = max(post + 10000, 60000)
+    while T <= window:
+        c, n = replay(T)
+        if best_cost is None or c < best_cost:
+            best_T, best_cost, best_n = T, c, n
+        T += 10000
+    best_cost += fixed
+    closed = post + math.sqrt(2 * K * max(growth, 1) / P["read"]) if growth > 0 else None
+
+    res = {
+        "transcript": path, "calls": len(calls), "first": calls[0]["at"], "last": calls[-1]["at"],
+        "cost": {"output": out_cost, "first_reads": first_cost, "re_reads": reread_cost, "total": total},
+        "context": {"p10": pct(ctx, .1), "p50": pct(ctx, .5), "p90": pct(ctx, .9), "max": max(ctx), "mean": statistics.mean(ctx)},
+        "growth_per_call": {"mean": growth, "median": growth_med},
+        "cache_misses": {"calls": misses, "cost": miss_cost},
+        "compactions": {"count": len(comps), "by_trigger": {t: sum(1 for v in comps if v["trigger"] == t) for t in sorted({str(v["trigger"]) for v in comps})},
+                        "post_context": post, "per": per, "cost_used": K, "cost_source": K_src},
+        "threshold": {"model_of_actual": model_actual, "rows": rows, "none": {"auto_at": window, "compactions": none_n, "cost": none_cost + fixed},
+                      "best": {"threshold": best_T, "compactions": best_n, "cost": best_cost}, "closed_form": closed},
+    }
+    if a.json:
+        print(json.dumps(res, indent=1))
+        return
+    sub = glob.glob(os.path.join(os.path.splitext(path)[0], "subagents", "*.jsonl"))
+    print("Session %s  %d main calls  %s .. %s" % (os.path.basename(path)[:8], len(calls), (calls[0]["at"] or "")[:16], (calls[-1]["at"] or "")[:16]))
+    print("Prices $/M: output %g, cache write 1h %g / 5m %g, cache read %g, input %g" % (a.price_output, a.price_write, a.price_write_5m, a.price_read, a.price_input))
+    print("Cost        output $%.2f (%d%%)   first reads $%.2f (%d%%)   re-reads $%.2f (%d%%)   total $%.2f%s" % (
+        out_cost, 100 * out_cost / total, first_cost, 100 * first_cost / total, reread_cost, 100 * reread_cost / total, total,
+        ("   (+%d subagent transcripts not counted)" % len(sub)) if sub else ""))
+    print("Context     p10 %s  p50 %s  p90 %s  max %s  mean %s" % tuple(k(x) for x in (pct(ctx, .1), pct(ctx, .5), pct(ctx, .9), max(ctx), statistics.mean(ctx))))
+    print("Growth      %+.0f tokens/call mean, %+.0f median (between compactions)" % (growth, growth_med))
+    print("Cache miss  %d calls re-wrote most of their context: $%.2f" % (misses, miss_cost))
+    trig = ", ".join("%s %d" % kv for kv in res["compactions"]["by_trigger"].items())
+    print("Compactions %d%s; context right after: %s%s" % (len(comps), (" (" + trig + ")") if comps else "", k(post), "" if firsts or a.post else " (assumed)"))
+    if per:
+        ms = sum(1 for p in per if p["measured"])
+        print("  one costs  $%.2f median = summariser $%.2f + re-cache $%.2f  (summariser %s)" % (
+            K, statistics.median([p["summariser"] for p in per]), statistics.median([p["recache"] for p in per]),
+            "measured for %d of %d" % (ms, len(per)) if ms else "estimated: not logged by the plugin"))
+    print("Threshold   replay of these calls, compaction cost $%.2f (%s), restart at %s;" % (K, K_src, k(post)))
+    print("            the replay of what happened comes to $%.2f (actual $%.2f); %% is against the replay" % (model_actual, total))
+    for T, n, c in rows:
+        print("  %5s  %4d compactions  $%9.2f  %+5.0f%%" % (k(T), n, c, 100 * (c - model_actual) / model_actual))
+    print("  %5s  %4d compactions  $%9.2f  %+5.0f%%  (no early compaction; auto at %s)" % ("none", none_n, none_cost + fixed, 100 * (none_cost + fixed - model_actual) / model_actual, k(window)))
+    print("  best   %s: %d compactions, $%.2f (%+.0f%%)" % (k(best_T), best_n, best_cost, 100 * (best_cost - model_actual) / model_actual))
+    if closed:
+        print("  closed form T* = post + sqrt(2 x cost x growth / read price) = %s" % k(closed))
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

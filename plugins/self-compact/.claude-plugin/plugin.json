@@ -1,0 +1,29 @@
+{
+  "name": "self-compact",
+  "version": "0.1.0",
+  "description": "Lets Claude compact its own session at a natural checkpoint, carrying a note over verbatim, with a soft context-size mark and a cost stats command",
+  "author": { "name": "Tom Medema" },
+  "license": "MIT",
+  "userConfig": {
+    "enabled": {
+      "type": "boolean",
+      "title": "Enabled",
+      "description": "Offer the compact tool and the context mark in this session. Set false in a project's settings to turn the plugin off there.",
+      "default": true
+    },
+    "threshold": {
+      "type": "number",
+      "title": "Mark threshold (tokens)",
+      "description": "Context size at which Claude is first told to compact at the next natural checkpoint.",
+      "default": 250000,
+      "min": 1000
+    },
+    "step": {
+      "type": "number",
+      "title": "Repeat step (tokens)",
+      "description": "After the first mark, Claude is reminded again only each time the context has grown by this much more.",
+      "default": 50000,
+      "min": 1000
+    }
+  }
+}

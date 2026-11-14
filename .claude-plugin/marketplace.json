@@ -1,0 +1,13 @@
+{
+  "name": "claude-self-compact",
+  "description": "Plugins that let Claude compact its own Claude Code session at a checkpoint it chooses",
+  "owner": { "name": "Tom Medema" },
+  "plugins": [
+    {
+      "name": "self-compact",
+      "description": "Lets Claude compact its own session at a natural checkpoint, carrying a note over verbatim, with a soft context-size mark and a cost stats command",
+      "source": "./plugins/self-compact",
+      "category": "productivity"
+    }
+  ]
+}
