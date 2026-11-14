@@ -34,7 +34,9 @@ Or add it to `~/.claude/settings.json`:
 }
 ```
 
-Start a new session afterwards. Update later with `claude plugin marketplace update claude-self-compact`.
+Start a new session afterwards; sessions already running do not pick it up. The install may say "3 userConfig options not yet set": unset options use the defaults below. To check it is on, run `/compact-stats` in the new session, or ask Claude whether `mcp__self-compact__compact` is among its tools.
+
+Update later with `claude plugin marketplace update claude-self-compact`.
 
 Requires Claude Code 2.1.321 or newer (the plugin is a hooks module, a "mod"), and `python3` for the stats command.
 
