@@ -5,7 +5,7 @@ Lets Claude compact its own Claude Code session at a moment it chooses, with a n
 The plugin adds:
 
 - **A tool**, `mcp__self-compact__compact`, with `carry` (Claude's own note: open threads, pending decisions, what it last told you, running background tasks, standing rules) and an optional `then` (what to continue with, so an unattended session keeps working). The compaction runs as soon as Claude's current turn ends. `carry` is re-inserted verbatim after the summary, and `then` is sent as the next prompt.
-- **A soft mark**: once the real context size of the last call (input + cache read + cache write tokens, read from the transcript) passes a threshold, Claude gets one line: `self-compact plugin: this session's context is at 312K tokens; compact at the next natural checkpoint`. It comes once on crossing, then again only after every further 50K. It never blocks, stops or interrupts anything.
+- **A soft mark**: once the real context size of the last call (input + cache read + cache write tokens, read from the transcript) passes a threshold, Claude gets one line: `self-compact plugin: this session's context is at 312K tokens; compact at the next natural checkpoint`. It comes once on crossing, then again only once the context has grown another 50K past the size it was last marked at (kept across reloads and resumes). It never blocks, stops or interrupts anything.
 - **Guidance** in the tool's description, which is always loaded: compact only at a natural checkpoint (work committed, notes current, reply to you sent, nothing that lives only in context), always before a known long idle, never in the middle of an investigation; and what to put in `carry`.
 - **A stats command** that prints, from a session's transcript, the cost split (output, first reads, re-reads), context size by percentile, growth per call, compactions, what one compaction costs, and the threshold that minimises cost.
 
@@ -76,13 +76,35 @@ With no argument it reads the newest transcript of the current directory's proje
 
 The threshold search replays the session's real calls: it re-reads the context before each call (re-writing it on a cache miss), writes each call's new tokens, and compacts back to the measured post-compaction size whenever the context reaches the threshold, charging one compaction each time. It also prints the closed form `T* = post + sqrt(2 × compaction cost × growth per call / cache read price)`.
 
+## Measured
+
+One real compaction through the plugin, in a desktop app Code tab session (Opus 5.5, 2026-11-14), at the user's prices (output $40, 1-hour cache write $16, cache read $0.20, input $8 per M):
+
+| Part | Tokens | Cost |
+| --- | --- | --- |
+| Claude writing the carry note (output) | 2,145 | $0.09 |
+| the short closing reply that ends the turn | 347,935, almost all cache read | $0.11 |
+| the summariser call | 354,701: 345,651 cache read, 4,693 output, 2,147 write, 2,210 input | $0.31 |
+| re-caching the new, shorter context (first call's write minus a normal call's) | 42,464 | $0.68 |
+| **one compaction** | | **$1.18** |
+
+The context went from 342,853 tokens to 99,265 on the first call after it (55,116 of them the system prompt and tools, still cached). It took 40 seconds. Each later call then reads about 246K fewer tokens, $0.05 less per call, so the compaction pays for itself in about 24 calls. On the desktop the context right after is larger than in the terminal (99K against 60K) because the app's system prompt, tool and skill listings are larger.
+
+What that cost means for the threshold, replaying a real 9-day supervisor session (5,673 calls, $1,261; 33 automatic compactions; context median 361K, 90th percentile 787K; +3,274 tokens per call) with $1.18 per compaction:
+
+| Threshold | 100K | 150K | 200K | 250K | 300K | 400K | 700K | none |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| restart at 60K | +5% | −13% | −16% | −17% | −16% | −14% | 0% | +12% |
+
+The cheapest is 260K (closed form 256K), 17% below the replay of what happened; restarting at the desktop's 99K it moves to about 300K. The curve is flat from 200K to 300K, so the default 250K is within one percentage point of the best in both cases; compacting much earlier (100K) costs more than never compacting early. Run the stats command on your own sessions to see your numbers.
+
 ## How it works
 
 Claude Code 2.1.32x lets a plugin ship a hooks module, and that module can compact the session. `$.session.compact()` makes the same call `/compact` makes. Where that call is not offered, `$.command.run({ command: 'compact' })` runs the built-in `/compact` command the way you would type it. Neither can run while a turn is still going (the engine refuses: "it would compact under the turn this hook is holding"). So the tool call only records the request, and the compaction runs when Claude's turn ends:
 
 1. Claude calls the tool. The plugin checks that it can compact here (main conversation, not a one-shot `claude -p`, compaction not disabled) and returns an error otherwise, with nothing changed. It saves the request to `~/.claude/self-compact/sessions/<session>.json` and tells Claude to end its turn.
 2. When the turn ends (`turn.complete`), the plugin compacts: through `$.session.compact` in the terminal, or through `/compact` in headless hosts (the desktop app, Agent SDK), where the engine runs compaction as a turn of its own. The summariser is told that Claude's note will follow, so the summary stays short.
-3. After the compaction it appends the `carry` text verbatim as a user-role row the model reads, then submits `then` as the next prompt. The session keeps its id, transcript and background tasks: this is the same in-place compaction `/compact` does.
+3. After the compaction it appends the `carry` text verbatim as a user-role row the model reads, with `then` repeated inside it, then submits `then` as the next prompt. The session keeps its id, transcript and background tasks: this is the same in-place compaction `/compact` does.
 4. If the compaction fails (a PreCompact hook blocks it, the API fails), the conversation is unchanged and Claude gets a note saying so. `then` is still sent so the session keeps working. Each compaction is logged, with the summariser's token usage, to `~/.claude/self-compact/compactions.jsonl`.
 
 The mark runs after each tool call and with each prompt you send. It reads the last call's usage from the end of the transcript and adds one line of context to that tool result or prompt.
@@ -92,7 +114,7 @@ The mark runs after each tool call and with each prompt you send. It reads the l
 | Surface | Works | How |
 | --- | --- | --- |
 | Interactive terminal (`claude`) | yes | `$.session.compact` |
-| Desktop app, Code tab | yes | `/compact` via `$.command.run` (the desktop runs Claude Code headless) |
+| Desktop app, Code tab | yes, shown on a real session (above) | `/compact` via `$.command.run` (the desktop runs Claude Code headless) |
 | Agent SDK / `claude --input-format stream-json` | yes | `/compact` via `$.command.run` |
 | One-shot `claude -p "…"` | no: the tool returns an error | the session ends with the turn, before a compaction could run |
 
@@ -103,5 +125,6 @@ The mark runs after each tool call and with each prompt you send. It reads the l
 - Compacting in the middle of a turn: the engine does not allow it, so the compaction always waits for the turn to end. If you interrupt that turn, the request is cancelled and Claude is told.
 - Failures that only show when the compaction runs (a blocking PreCompact hook, an API error) cannot be returned by the tool call, which has already returned. They arrive as a note in the conversation instead, and the conversation is left as it was.
 - In the terminal the transcript is written slightly behind the live session, so the mark can lag one call: it reports the size of the call before.
+- If something is already queued when the compaction finishes (a background task's notification, a message you typed), it takes the first turn and the `then` prompt follows it. The carry note repeats `then`, so Claude carries on in that first turn anyway, and it tells Claude not to redo finished work when the `then` prompt itself arrives.
 - On the desktop and SDK path the `/compact` command and its arguments (the short summariser instruction, not your note) stay in the context as the command's record.
 - Plugin options are read from user settings only; per project, use the environment variables above.
