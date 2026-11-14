@@ -117,7 +117,7 @@ def pct(xs, q):
 
 def plugin_log(session_path):
     """Summariser usage the self-compact plugin recorded for this session, by finish time."""
-    path = os.path.join(config_dir(), "self-compact", "compactions.jsonl")
+    path = os.path.join(os.environ.get("SELF_COMPACT_HOME") or os.path.join(config_dir(), "self-compact"), "compactions.jsonl")
     out = []
     if not os.path.isfile(path):
         return out

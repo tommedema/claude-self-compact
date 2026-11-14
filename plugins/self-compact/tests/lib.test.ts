@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { applyEnv, boundarySince, carryRow, clockStamp, isOneShot, lastContextFromTail, markDecision, readSettings, span, summariserInstructions } from '../hooks/lib'
+import { applyEnv, boundarySince, carryRow, clockStamp, isOneShot, lastContextFromTail, lastReportFromTail, markDecision, readSettings, span, summariserInstructions } from '../hooks/lib'
 
 const call = (cr: number, cw: number, inp = 2, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'assistant', message: { model: 'm', usage: { input_tokens: inp, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, output_tokens: 9 } }, ...extra })
@@ -74,4 +74,28 @@ test('the summariser is told to cover what happened after the note was written',
   expect(text.includes('do not restate it')).toBe(true)
   expect(text.includes('went on after it')).toBe(true)
   expect(text.includes('cover all of it in full')).toBe(true)
+})
+
+test('the last report before the compact call is found word for word', async () => {
+  const says = (text: string, extra: Record<string, unknown> = {}) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text }] }, ...extra })
+  const calls = (name: string) => JSON.stringify({ type: 'assistant', message: { content: [{ type: 'tool_use', name, input: { carry: 'x'.repeat(900) } }] } })
+  const report = `The finding first.\n\n- one "quoted" line\n- ${'detail '.repeat(80)}`.trim()
+  const old = 'An older report. '.repeat(40).trim()
+  const tail = ['{"partial', says(old), says(report), says('short progress line'), says('a subagent wrote this at length. '.repeat(30), { isSidechain: true }),
+    calls('Bash'), calls('mcp__self-compact__compact'), says('Compacting now. ' + 'closing words '.repeat(40))].join('\n')
+  expect(lastReportFromTail(tail)).toBe(report)
+  // Nothing long enough, no compact call, or only reports from before an earlier compaction: no report.
+  expect(lastReportFromTail([says('short'), calls('mcp__self-compact__compact')].join('\n'))).toBe(undefined)
+  expect(lastReportFromTail([says(report), says('done')].join('\n'))).toBe(undefined)
+  expect(lastReportFromTail([says(report), boundary('2026-11-14T00:00:00Z'), says('short'), calls('mcp__self-compact__compact')].join('\n'))).toBe(undefined)
+  // A report in the same row as the call counts; words after the call in that row do not.
+  const together = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: report }, { type: 'tool_use', name: 'mcp__self-compact__compact', input: {} }, { type: 'text', text: 'z'.repeat(600) }] } })
+  expect(lastReportFromTail([says(old), together].join('\n'))).toBe(report)
+  // A very long one is cut, and says so.
+  const cut = lastReportFromTail([says('y'.repeat(900)), calls('mcp__self-compact__compact')].join('\n'), 400, 500) ?? ''
+  expect(cut.startsWith('y'.repeat(500) + '\n[cut here: the report went on for 400 more characters]')).toBe(true)
+  const row = carryRow('note', undefined, 'go on', undefined, report)
+  expect(row.includes(`<last-report>\n${report}\n</last-report>`)).toBe(true)
+  expect(row.indexOf('</carry>') < row.indexOf('<last-report>') && row.indexOf('</last-report>') < row.indexOf('<then>')).toBe(true)
+  expect(carryRow('note', undefined, undefined).includes('<last-report>')).toBe(false)
 })

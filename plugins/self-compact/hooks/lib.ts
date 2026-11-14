@@ -78,6 +78,49 @@ export function boundarySince(text: string, sinceMs: number): boolean {
   return false
 }
 
+// The last report Claude wrote before it asked for the compaction: the newest
+// main-conversation text of at least `minChars` characters that comes before
+// its latest compact tool call in a transcript chunk (short progress lines are
+// passed over). The engine keeps only the very last message word for word, and
+// that is the closing line after the tool call, so the report itself would
+// reach the next context only as the summariser retells it, while a reply or a
+// review that arrives later quotes it by the sentence. Cut at `maxChars`.
+export function lastReportFromTail(text: string, minChars = 400, maxChars = 20_000): string | undefined {
+  const lines = text.split('\n')
+  let called = false
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i] ?? ''
+    if (!line.includes('"assistant"') && !line.includes('"compact_boundary"')) continue
+    let row: any
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row?.isSidechain) continue
+    // Past an earlier compaction there is nothing the context still held.
+    if (row?.subtype === 'compact_boundary') {
+      if (called) return undefined
+      continue
+    }
+    const blocks = row?.type === 'assistant' && Array.isArray(row.message?.content) ? row.message.content : []
+    // In the row of the call itself only what stands before the call counts.
+    let from = blocks.length - 1
+    if (!called) {
+      from = blocks.findLastIndex((b: any) => b?.type === 'tool_use' && b.name === TOOL_FULL) - 1
+      if (from < -1) continue
+      called = true
+    }
+    for (let j = from; j >= 0; j--) {
+      const report = blocks[j]?.type === 'text' && typeof blocks[j].text === 'string' ? blocks[j].text.trim() : ''
+      if (report.length >= minChars) {
+        return report.length > maxChars ? `${report.slice(0, maxChars)}\n[cut here: the report went on for ${(report.length - maxChars).toLocaleString('en-US')} more characters]` : report
+      }
+    }
+  }
+  return undefined
+}
+
 // Soft mark: once when the context first reaches the threshold, then again only
 // after it has grown a further `step` tokens past the size it was marked at.
 // Returns the new `nextAt` and whether to mark now.
@@ -152,7 +195,8 @@ export function span(ms: number): string {
 // `when` puts the real clock on the row: a time Claude wrote into its note is
 // its own estimate and is copied forward from note to note, so the row says
 // what the machine's clock read, and how long ago the previous compaction was.
-export function carryRow(carry: string, before: number | undefined, then: string | undefined, when?: { now: Date; sincePrevMs?: number }): string {
+// `report` is Claude's last report, word for word (lastReportFromTail).
+export function carryRow(carry: string, before: number | undefined, then: string | undefined, when?: { now: Date; sincePrevMs?: number }, report?: string): string {
   const size = before ? ` (context was ${before.toLocaleString('en-US')} tokens)` : ''
   const prev = when?.sincePrevMs !== undefined ? `, ${span(when.sincePrevMs)} after the previous compaction` : ''
   const clock = when ? ` The machine's clock at this compaction: ${clockStamp(when.now)} local time${prev}; where a time in the note disagrees, the clock is right.` : ''
@@ -162,6 +206,9 @@ export function carryRow(carry: string, before: number | undefined, then: string
     '<carry>',
     carry,
     '</carry>',
+    ...(report
+      ? ['', 'Your last report before you asked for the compaction, word for word as you wrote it (a reply or a review that comes later may quote it by the sentence):', '', '<last-report>', report, '</last-report>']
+      : []),
     ...(then
       ? ['', 'Your `then` instruction, also sent as the next prompt (if something else arrives first, carry on with it anyway; when the prompt itself arrives, do not redo work already done):', '', '<then>', then, '</then>']
       : []),

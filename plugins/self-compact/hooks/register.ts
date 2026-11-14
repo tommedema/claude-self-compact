@@ -17,7 +17,7 @@
 import type { Register } from 'claude-code'
 import {
   INPUT_SCHEMA, PLUGIN, TOOL, TOOL_DESCRIPTION, TOOL_FULL,
-  applyEnv, boundarySince, carryRow, failureRow, isOneShot, lastContextFromTail, markDecision,
+  applyEnv, boundarySince, carryRow, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision,
   markLine, readSettings, summariserInstructions,
 } from './lib'
 import type { Settings } from './lib'
@@ -83,6 +83,19 @@ async function readContext($: any): Promise<number | undefined> {
   return undefined
 }
 
+// Claude's last report before the compact call, read while the transcript still ends with this turn.
+async function readLastReport($: any): Promise<string | undefined> {
+  const path = await findTranscript($)
+  if (!path) return undefined
+  for (const bytes of [1_000_000, 8_000_000]) {
+    const text = await tail($, path, bytes)
+    if (text === undefined) return undefined
+    const report = lastReportFromTail(text)
+    if (report !== undefined) return report
+  }
+  return undefined
+}
+
 async function saveState($: any, extra: Record<string, unknown>): Promise<void> {
   if (!S.stateDir || !S.sessionId) return
   const state = { sessionId: S.sessionId, transcriptPath: S.transcriptPath, nextMarkAt: S.nextMarkAt, lastCompactionAt: S.lastCompactionAt, pending: S.pending ?? null, ...extra }
@@ -142,6 +155,7 @@ async function compactViaCommand($: any, instructions: string, startedAt: number
 
 async function runCompaction($: any, req: Request): Promise<void> {
   const instructions = summariserInstructions()
+  const report = await readLastReport($)
   const startedAt = Date.now()
   let outcome: Outcome
   try {
@@ -161,7 +175,7 @@ async function runCompaction($: any, req: Request): Promise<void> {
     const now = Date.now()
     const sincePrevMs = S.lastCompactionAt !== undefined && now > S.lastCompactionAt ? now - S.lastCompactionAt : undefined
     S.lastCompactionAt = now
-    await note($, carryRow(req.carry, req.contextBefore, req.then, { now: new Date(now), sincePrevMs }))
+    await note($, carryRow(req.carry, req.contextBefore, req.then, { now: new Date(now), sincePrevMs }, report))
   } else {
     await note($, failureRow(outcome.reason, !!req.then))
   }
@@ -170,7 +184,7 @@ async function runCompaction($: any, req: Request): Promise<void> {
   await appendLog($, {
     at: new Date().toISOString(), sessionId: S.sessionId, transcriptPath: S.transcriptPath, ...outcome,
     contextBefore: req.contextBefore, requestedAt: new Date(req.requestedAt).toISOString(),
-    durationMs: Date.now() - startedAt, carryChars: req.carry.length, hasThen: !!req.then,
+    durationMs: Date.now() - startedAt, carryChars: req.carry.length, reportChars: report?.length ?? 0, hasThen: !!req.then,
   })
   if (req.then) {
     try {
@@ -189,7 +203,9 @@ async function startSession($: any, isInteractive: boolean): Promise<void> {
   })
   if (!S.settings.enabled) return
   S.sessionId = await $.session.id()
-  S.stateDir = `${await configDir($)}/${PLUGIN}`
+  // SELF_COMPACT_HOME: another folder for the state files and the log, so a test session that
+  // needs the real config folder for its login does not write into the real log (tests/e2e.py).
+  S.stateDir = (await $.env.get('SELF_COMPACT_HOME')) || `${await configDir($)}/${PLUGIN}`
   await restoreMark($)
   if (!isInteractive) {
     try {
