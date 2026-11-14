@@ -5,8 +5,12 @@
 //   as soon as that turn ends (turn.complete), through $.session.compact where the
 //   engine offers it (interactive terminal) and through the built-in /compact
 //   command elsewhere (the desktop app, Agent SDK hosts), which run it as a turn.
-// - After the compaction the carry note is appended verbatim as a user-role row,
-//   and `then`, if given, is submitted as the next prompt.
+// - After the compaction the carry note is appended verbatim as a user-role row
+//   that opens with the machine's clock, and `then`, if given, is submitted as
+//   the next prompt.
+// - While a request waits for the turn to end, the session's state file has
+//   `pending` set: a Stop hook can read it and stand aside for that stop, so
+//   the note is not made stale by work the hook would ask for (README).
 // - A soft mark: after tool calls and user prompts, the real context size of the
 //   last call is read from the transcript; past the threshold Claude gets one
 //   line, once, then again only every further `step` tokens. It never blocks.
@@ -35,6 +39,7 @@ const S: {
   inFlight?: { instructions: string } // running through the /compact command
   hookOutcome?: Outcome
   nextMarkAt?: number
+  lastCompactionAt?: number // when the latest compaction of this session finished, by anyone
 } = { settings: readSettings({}), oneShot: false, running: false }
 
 function errText(err: unknown): string {
@@ -80,18 +85,22 @@ async function readContext($: any): Promise<number | undefined> {
 
 async function saveState($: any, extra: Record<string, unknown>): Promise<void> {
   if (!S.stateDir || !S.sessionId) return
-  const state = { sessionId: S.sessionId, transcriptPath: S.transcriptPath, nextMarkAt: S.nextMarkAt, pending: S.pending ?? null, ...extra }
+  const state = { sessionId: S.sessionId, transcriptPath: S.transcriptPath, nextMarkAt: S.nextMarkAt, lastCompactionAt: S.lastCompactionAt, pending: S.pending ?? null, ...extra }
   try {
     await $.fs.write(`${S.stateDir}/sessions/${S.sessionId}.json`, JSON.stringify(state, null, 2) + '\n')
   } catch {}
 }
 
+// One line appended with `>>`: several sessions log here, and reading the file
+// to write it back whole let two that finished together drop each other's line.
 async function appendLog($: any, entry: Record<string, unknown>): Promise<void> {
   if (!S.stateDir) return
-  const path = `${S.stateDir}/compactions.jsonl`
-  let old = ''
-  try { old = await $.fs.read(path) } catch {}
-  try { await $.fs.write(path, old + JSON.stringify(entry) + '\n') } catch {}
+  try {
+    await $.process.run(
+      ['/bin/sh', '-c', 'mkdir -p "$1" && printf \'%s\\n\' "$2" >> "$1/compactions.jsonl"', 'sh', S.stateDir, JSON.stringify(entry)],
+      { timeoutMs: 10_000 },
+    )
+  } catch {}
 }
 
 async function maybeMark($: any): Promise<string | undefined> {
@@ -149,7 +158,10 @@ async function runCompaction($: any, req: Request): Promise<void> {
 
   if (outcome.ok) {
     S.nextMarkAt = undefined
-    await note($, carryRow(req.carry, req.contextBefore, req.then))
+    const now = Date.now()
+    const sincePrevMs = S.lastCompactionAt !== undefined && now > S.lastCompactionAt ? now - S.lastCompactionAt : undefined
+    S.lastCompactionAt = now
+    await note($, carryRow(req.carry, req.contextBefore, req.then, { now: new Date(now), sincePrevMs }))
   } else {
     await note($, failureRow(outcome.reason, !!req.then))
   }
@@ -192,13 +204,13 @@ async function startSession($: any, isInteractive: boolean): Promise<void> {
   })
 }
 
-// Where the next mark is due survives a reload or a resume: it is kept in the
-// session's state file.
+// Where the next mark is due, and when the session was last compacted, survive
+// a reload or a resume: they are kept in the session's state file.
 async function restoreMark($: any): Promise<void> {
-  if (S.nextMarkAt !== undefined) return
   try {
     const saved = JSON.parse(await $.fs.read(`${S.stateDir}/sessions/${S.sessionId}.json`))
-    if (typeof saved?.nextMarkAt === 'number') S.nextMarkAt = saved.nextMarkAt
+    if (S.nextMarkAt === undefined && typeof saved?.nextMarkAt === 'number') S.nextMarkAt = saved.nextMarkAt
+    if (S.lastCompactionAt === undefined && typeof saved?.lastCompactionAt === 'number') S.lastCompactionAt = saved.lastCompactionAt
   } catch {}
 }
 
@@ -307,7 +319,11 @@ export const register: Register = (on, options) => {
       }
       if (ok) {
         S.nextMarkAt = undefined
-        if (!mine) await saveState($, {})
+        // An automatic or typed compaction counts too; one of this plugin's own is timed in runCompaction.
+        if (!mine) {
+          S.lastCompactionAt = Date.now()
+          await saveState($, {})
+        }
       }
       return c
     } catch (err) {

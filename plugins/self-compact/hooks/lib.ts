@@ -121,17 +121,43 @@ export const INPUT_SCHEMA = {
 // summariser already reads it in the compact tool call at the end of the
 // conversation, and on hosts that compact through the /compact command these
 // instructions stay in the context as that command's arguments.
+// The turn can go on after the tool call (a Stop hook that asks for more holds
+// it open, and the compaction waits for the turn to end): what was done then is
+// in nobody's note, so the summariser is told to cover it in full.
 export function summariserInstructions(): string {
-  return 'The assistant asked for this compaction itself, at a checkpoint. Its carry-over note (the carry argument of its last mcp__self-compact__compact call) is re-inserted word for word right after your summary, so do not restate it: keep the summary short and cover what the note leaves out (files touched, results and numbers, the user\'s exact recent requests).'
+  return [
+    'The assistant asked for this compaction itself, at a checkpoint. Its carry-over note (the carry argument of its last mcp__self-compact__compact call) is re-inserted word for word right after your summary, so do not restate it: keep the summary short and cover what the note leaves out (files touched, results and numbers, the user\'s exact recent requests).',
+    'The note was written at that tool call. If the conversation went on after it (more tool calls, edits, commits, replies, a hook that asked for more work), none of that is in the note: cover all of it in full, and say where it changes or contradicts the note.',
+  ].join(' ')
+}
+
+// The clock at a compaction, in the machine's own time zone: "2026-11-14 12:44".
+export function clockStamp(now: Date): string {
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `${now.getFullYear()}-${two(now.getMonth() + 1)}-${two(now.getDate())} ${two(now.getHours())}:${two(now.getMinutes())}`
+}
+
+// "38 minutes", "2 hours 5 minutes".
+export function span(ms: number): string {
+  const minutes = Math.max(0, Math.round(ms / 60_000))
+  const plural = (n: number, unit: string) => `${n} ${unit}${n === 1 ? '' : 's'}`
+  if (minutes < 60) return plural(minutes, 'minute')
+  const rest = minutes % 60
+  return plural(Math.floor(minutes / 60), 'hour') + (rest ? ` ${plural(rest, 'minute')}` : '')
 }
 
 // `then` is repeated here because something already queued (a background task's
 // notification, a message the user typed) can take the first turn after the
 // compaction, ahead of the submitted `then` prompt.
-export function carryRow(carry: string, before: number | undefined, then: string | undefined): string {
+// `when` puts the real clock on the row: a time Claude wrote into its note is
+// its own estimate and is copied forward from note to note, so the row says
+// what the machine's clock read, and how long ago the previous compaction was.
+export function carryRow(carry: string, before: number | undefined, then: string | undefined, when?: { now: Date; sincePrevMs?: number }): string {
   const size = before ? ` (context was ${before.toLocaleString('en-US')} tokens)` : ''
+  const prev = when?.sincePrevMs !== undefined ? `, ${span(when.sincePrevMs)} after the previous compaction` : ''
+  const clock = when ? ` The machine's clock at this compaction: ${clockStamp(when.now)} local time${prev}; where a time in the note disagrees, the clock is right.` : ''
   return [
-    `[self-compact] This conversation was compacted at your request${size}. Your carry-over note, verbatim:`,
+    `[self-compact] This conversation was compacted at your request${size}.${clock} Your carry-over note, verbatim:`,
     '',
     '<carry>',
     carry,

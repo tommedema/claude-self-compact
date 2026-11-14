@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { applyEnv, boundarySince, carryRow, isOneShot, lastContextFromTail, markDecision, readSettings } from '../hooks/lib'
+import { applyEnv, boundarySince, carryRow, clockStamp, isOneShot, lastContextFromTail, markDecision, readSettings, span, summariserInstructions } from '../hooks/lib'
 
 const call = (cr: number, cw: number, inp = 2, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'assistant', message: { model: 'm', usage: { input_tokens: inp, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, output_tokens: 9 } }, ...extra })
@@ -54,4 +54,24 @@ test('the carry note comes back verbatim, with then repeated when given', async 
   expect(row.includes('342,853 tokens')).toBe(true)
   expect(row.includes('<then>\ngo on\n</then>')).toBe(true)
   expect(carryRow(carry, undefined, undefined).includes('<then>')).toBe(false)
+})
+
+test('the row carries the machine clock and the time since the previous compaction', async () => {
+  const now = new Date(2026, 10, 14, 12, 4) // local time, as the row prints it
+  expect(clockStamp(now)).toBe('2026-11-14 12:04')
+  expect([span(20_000), span(60_000), span(38 * 60_000), span(125 * 60_000), span(120 * 60_000)]).toEqual(['0 minutes', '1 minute', '38 minutes', '2 hours 5 minutes', '2 hours'])
+  const row = carryRow('written about 13:15', 257660, undefined, { now, sincePrevMs: 38 * 60_000 })
+  expect(row.includes('2026-11-14 12:04 local time, 38 minutes after the previous compaction')).toBe(true)
+  expect(row.includes('<carry>\nwritten about 13:15\n</carry>')).toBe(true)
+  // The first compaction of a session has no previous one to measure from.
+  const first = carryRow('note', undefined, undefined, { now })
+  expect(first.includes('2026-11-14 12:04 local time;')).toBe(true)
+  expect(first.includes('previous compaction')).toBe(false)
+})
+
+test('the summariser is told to cover what happened after the note was written', async () => {
+  const text = summariserInstructions()
+  expect(text.includes('do not restate it')).toBe(true)
+  expect(text.includes('went on after it')).toBe(true)
+  expect(text.includes('cover all of it in full')).toBe(true)
 })

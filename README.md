@@ -4,7 +4,7 @@ Lets Claude compact its own Claude Code session at a moment it chooses, with a n
 
 The plugin adds:
 
-- **A tool**, `mcp__self-compact__compact`, with `carry` (Claude's own note: open threads, pending decisions, what it last told you, running background tasks, standing rules) and an optional `then` (what to continue with, so an unattended session keeps working). The compaction runs as soon as Claude's current turn ends. `carry` is re-inserted verbatim after the summary, and `then` is sent as the next prompt.
+- **A tool**, `mcp__self-compact__compact`, with `carry` (Claude's own note: open threads, pending decisions, what it last told you, running background tasks, standing rules) and an optional `then` (what to continue with, so an unattended session keeps working). The compaction runs as soon as Claude's current turn ends. `carry` is re-inserted verbatim after the summary, with the machine's clock time and how long ago the previous compaction was, and `then` is sent as the next prompt.
 - **A soft mark**: once the real context size of the last call (input + cache read + cache write tokens, read from the transcript) passes a threshold, Claude gets one line: `self-compact plugin: this session's context is at 312K tokens; compact at the next natural checkpoint`. It comes once on crossing, then again only once the context has grown another 50K past the size it was last marked at (kept across reloads and resumes). It never blocks, stops or interrupts anything.
 - **Guidance** in the tool's description, which is always loaded: compact only at a natural checkpoint (work committed, notes current, reply to you sent, nothing that lives only in context), always before a known long idle, never in the middle of an investigation; and what to put in `carry`.
 - **A stats command** that prints, from a session's transcript, the cost split (output, first reads, re-reads), context size by percentile, growth per call, compactions, what one compaction costs, and the threshold that minimises cost.
@@ -106,10 +106,17 @@ Claude Code 2.1.32x lets a plugin ship a hooks module, and that module can compa
 
 1. Claude calls the tool. The plugin checks that it can compact here (main conversation, not a one-shot `claude -p`, compaction not disabled) and returns an error otherwise, with nothing changed. It saves the request to `~/.claude/self-compact/sessions/<session>.json` and tells Claude to end its turn.
 2. When the turn ends (`turn.complete`), the plugin compacts: through `$.session.compact` in the terminal, or through `/compact` in headless hosts (the desktop app, Agent SDK), where the engine runs compaction as a turn of its own. The summariser is told that Claude's note will follow, so the summary stays short.
-3. After the compaction it appends the `carry` text verbatim as a user-role row the model reads, with `then` repeated inside it, then submits `then` as the next prompt. The session keeps its id, transcript and background tasks: this is the same in-place compaction `/compact` does.
-4. If the compaction fails (a PreCompact hook blocks it, the API fails), the conversation is unchanged and Claude gets a note saying so. `then` is still sent so the session keeps working. Each compaction is logged, with the summariser's token usage, to `~/.claude/self-compact/compactions.jsonl`.
+3. After the compaction it appends the `carry` text verbatim as a user-role row the model reads, with `then` repeated inside it, then submits `then` as the next prompt. The row opens with the machine's clock (`2026-11-14 12:44 local time, 38 minutes after the previous compaction`): a time Claude writes into its note is its own estimate, was once 31 minutes off, and would otherwise be copied from note to note. The session keeps its id, transcript and background tasks: this is the same in-place compaction `/compact` does.
+4. If the compaction fails (a PreCompact hook blocks it, the API fails), the conversation is unchanged and Claude gets a note saying so. `then` is still sent so the session keeps working. Each compaction is logged, with the summariser's token usage, to `~/.claude/self-compact/compactions.jsonl` (one appended line each, so sessions that finish together do not lose each other's).
 
 The mark runs after each tool call and with each prompt you send. It reads the last call's usage from the end of the transcript and adds one line of context to that tool result or prompt.
+
+## Stop hooks and the note
+
+The note is written when Claude calls the tool; the compaction runs when the turn ends. A Stop hook that blocks the stop (a reviewer, a check that asks for more work) holds the turn open in between, and whatever Claude then does is not in its note. In one supervisor session this happened at four of five compactions: three to four minutes of edits and a commit after the note was written.
+
+- The summariser is told that the turn may have gone on after the tool call and to cover all of that in full, so it reaches the next context whatever the hook is.
+- A hook of your own can stand aside for that one stop, which keeps the note current. While a request waits, `~/.claude/self-compact/sessions/<session id>.json` has `pending` set (`requestedAt` in milliseconds, `then` when the session carries on by itself); it is `null` again once the compaction has run or was cancelled. Treat a request older than a few minutes as left over from a session that died.
 
 ## Surfaces
 
