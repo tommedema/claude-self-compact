@@ -279,9 +279,11 @@ def main(argv):
     print("Compactions %d%s; context right after: %s%s" % (len(comps), (" (" + trig + ")") if comps else "", k(post), "" if firsts or a.post else " (assumed)"))
     if per:
         ms = sum(1 for p in per if p["measured"])
-        print("  one costs  $%.2f median = summariser $%.2f + re-cache $%.2f  (summariser %s)" % (
-            K, statistics.median([p["summariser"] for p in per]), statistics.median([p["recache"] for p in per]),
-            "measured for %d of %d" % (ms, len(per)) if ms else "estimated: not logged by the plugin"))
+        print("  one costs  $%.2f median = summariser $%.2f + re-cache $%.2f  (summariser %s)%s" % (
+            statistics.median([p["total"] for p in per]), statistics.median([p["summariser"] for p in per]),
+            statistics.median([p["recache"] for p in per]),
+            "measured for %d of %d" % (ms, len(per)) if ms else "estimated: not logged by the plugin",
+            "; the search below uses the given $%.2f" % K if a.compaction_cost is not None else ""))
     print("Threshold   replay of these calls, compaction cost $%.2f (%s), restart at %s;" % (K, K_src, k(post)))
     print("            the replay of what happened comes to $%.2f (actual $%.2f); %% is against the replay" % (model_actual, total))
     for T, n, c in rows:

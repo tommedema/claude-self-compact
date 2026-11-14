@@ -79,12 +79,13 @@ export function boundarySince(text: string, sinceMs: number): boolean {
 }
 
 // Soft mark: once when the context first reaches the threshold, then again only
-// each further `step` tokens. Returns the new `nextAt` and whether to mark now.
+// after it has grown a further `step` tokens past the size it was marked at.
+// Returns the new `nextAt` and whether to mark now.
 export function markDecision(ctx: number, nextAt: number | undefined, s: Settings): { mark: boolean; nextAt: number } {
   if (ctx < s.threshold) return { mark: false, nextAt: s.threshold }
   const at = nextAt ?? s.threshold
   if (ctx < at) return { mark: false, nextAt: at }
-  return { mark: true, nextAt: s.threshold + (Math.floor((ctx - s.threshold) / s.step) + 1) * s.step }
+  return { mark: true, nextAt: ctx + s.step }
 }
 
 export function kTokens(n: number): string {
@@ -124,7 +125,10 @@ export function summariserInstructions(): string {
   return 'The assistant asked for this compaction itself, at a checkpoint. Its carry-over note (the carry argument of its last mcp__self-compact__compact call) is re-inserted word for word right after your summary, so do not restate it: keep the summary short and cover what the note leaves out (files touched, results and numbers, the user\'s exact recent requests).'
 }
 
-export function carryRow(carry: string, before: number | undefined, hasThen: boolean): string {
+// `then` is repeated here because something already queued (a background task's
+// notification, a message the user typed) can take the first turn after the
+// compaction, ahead of the submitted `then` prompt.
+export function carryRow(carry: string, before: number | undefined, then: string | undefined): string {
   const size = before ? ` (context was ${before.toLocaleString('en-US')} tokens)` : ''
   return [
     `[self-compact] This conversation was compacted at your request${size}. Your carry-over note, verbatim:`,
@@ -132,7 +136,9 @@ export function carryRow(carry: string, before: number | undefined, hasThen: boo
     '<carry>',
     carry,
     '</carry>',
-    ...(hasThen ? ['', 'Your `then` instruction follows as the next prompt.'] : []),
+    ...(then
+      ? ['', 'Your `then` instruction, also sent as the next prompt (if something else arrives first, carry on with it anyway; when the prompt itself arrives, do not redo work already done):', '', '<then>', then, '</then>']
+      : []),
   ].join('\n')
 }
 

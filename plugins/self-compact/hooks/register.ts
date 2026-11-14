@@ -149,7 +149,7 @@ async function runCompaction($: any, req: Request): Promise<void> {
 
   if (outcome.ok) {
     S.nextMarkAt = undefined
-    await note($, carryRow(req.carry, req.contextBefore, !!req.then))
+    await note($, carryRow(req.carry, req.contextBefore, req.then))
   } else {
     await note($, failureRow(outcome.reason, !!req.then))
   }
@@ -178,6 +178,7 @@ async function startSession($: any, isInteractive: boolean): Promise<void> {
   if (!S.settings.enabled) return
   S.sessionId = await $.session.id()
   S.stateDir = `${await configDir($)}/${PLUGIN}`
+  await restoreMark($)
   if (!isInteractive) {
     try {
       const r = await $.process.run(['/bin/sh', '-c', 'ps -o args= -p "$PPID"'], { timeoutMs: 5_000 })
@@ -189,6 +190,16 @@ async function startSession($: any, isInteractive: boolean): Promise<void> {
     name: 'compact-stats',
     description: 'self-compact: cost split, context percentiles, growth, compactions and the cheapest threshold for this session',
   })
+}
+
+// Where the next mark is due survives a reload or a resume: it is kept in the
+// session's state file.
+async function restoreMark($: any): Promise<void> {
+  if (S.nextMarkAt !== undefined) return
+  try {
+    const saved = JSON.parse(await $.fs.read(`${S.stateDir}/sessions/${S.sessionId}.json`))
+    if (typeof saved?.nextMarkAt === 'number') S.nextMarkAt = saved.nextMarkAt
+  } catch {}
 }
 
 async function requestCompaction($: any, e: any): Promise<any> {
@@ -294,7 +305,10 @@ export const register: Register = (on, options) => {
       } else if (ok) {
         await appendLog($, { at: new Date().toISOString(), sessionId: S.sessionId, transcriptPath: S.transcriptPath, ok: true, via: e.trigger, tokensBefore: c?.tokensBefore, tokensAfter: c?.tokensAfter, usage: c?.usage })
       }
-      if (ok) S.nextMarkAt = undefined
+      if (ok) {
+        S.nextMarkAt = undefined
+        if (!mine) await saveState($, {})
+      }
       return c
     } catch (err) {
       if (mine) S.hookOutcome = { ok: false, via: '/compact', reason: errText(err) }

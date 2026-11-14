@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { applyEnv, boundarySince, isOneShot, lastContextFromTail, markDecision, readSettings } from '../hooks/lib'
+import { applyEnv, boundarySince, carryRow, isOneShot, lastContextFromTail, markDecision, readSettings } from '../hooks/lib'
 
 const call = (cr: number, cw: number, inp = 2, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'assistant', message: { model: 'm', usage: { input_tokens: inp, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, output_tokens: 9 } }, ...extra })
@@ -18,17 +18,17 @@ test('a compaction newer than every call leaves the size unknown', async () => {
   expect(boundarySince(boundary('2026-11-13T00:00:00Z'), Date.parse('2026-11-14T00:00:00Z'))).toBe(false)
 })
 
-test('the mark fires once on crossing, then once per further step', async () => {
+test('the mark fires once on crossing, then once per further step past the marked size', async () => {
   const s = readSettings({})
   expect(s).toEqual({ enabled: true, threshold: 250000, step: 50000 })
   let at: number | undefined
   const seen: number[] = []
-  for (const ctx of [100000, 249999, 251000, 270000, 299000, 300500, 320000, 420000, 430000, 60000, 255000]) {
+  for (const ctx of [100000, 249999, 251000, 270000, 299000, 301500, 320000, 350000, 420000, 430000, 60000, 255000, 342000, 349000, 393000]) {
     const d = markDecision(ctx, at, s)
     at = d.nextAt
     if (d.mark) seen.push(ctx)
   }
-  expect(seen).toEqual([251000, 300500, 420000, 255000])
+  expect(seen).toEqual([251000, 301500, 420000, 255000, 342000, 393000])
 })
 
 test('one-shot runs are told apart from streaming hosts', async () => {
@@ -45,4 +45,13 @@ test('project env overrides the user options', async () => {
   expect(applyEnv(base, { enabled: 'false', threshold: '120_000', step: '20000' })).toEqual({ enabled: false, threshold: 120000, step: 20000 })
   expect(applyEnv(readSettings({ enabled: false }), { enabled: '1' }).enabled).toBe(true)
   expect(applyEnv(base, { threshold: 'lots' }).threshold).toBe(300000)
+})
+
+test('the carry note comes back verbatim, with then repeated when given', async () => {
+  const carry = 'line 1\n  <b>exact</b> $x `y`\nline 3'
+  const row = carryRow(carry, 342853, 'go on')
+  expect(row.includes(`<carry>\n${carry}\n</carry>`)).toBe(true)
+  expect(row.includes('342,853 tokens')).toBe(true)
+  expect(row.includes('<then>\ngo on\n</then>')).toBe(true)
+  expect(carryRow(carry, undefined, undefined).includes('<then>')).toBe(false)
 })
