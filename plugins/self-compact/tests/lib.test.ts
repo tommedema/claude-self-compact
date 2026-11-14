@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { boundarySince, isOneShot, lastContextFromTail, markDecision, readSettings } from '../hooks/lib'
+import { applyEnv, boundarySince, isOneShot, lastContextFromTail, markDecision, readSettings } from '../hooks/lib'
 
 const call = (cr: number, cw: number, inp = 2, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'assistant', message: { model: 'm', usage: { input_tokens: inp, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, output_tokens: 9 } }, ...extra })
@@ -37,4 +37,12 @@ test('one-shot runs are told apart from streaming hosts', async () => {
   expect(isOneShot('claude --output-format stream-json --verbose --input-format stream-json --model x')).toBe(false)
   expect(isOneShot('claude -p --input-format stream-json')).toBe(false)
   expect(isOneShot('claude --plugin-dir x')).toBe(false)
+})
+
+test('project env overrides the user options', async () => {
+  const base = readSettings({ threshold: 300000 })
+  expect(applyEnv(base, {})).toEqual({ enabled: true, threshold: 300000, step: 50000 })
+  expect(applyEnv(base, { enabled: 'false', threshold: '120_000', step: '20000' })).toEqual({ enabled: false, threshold: 120000, step: 20000 })
+  expect(applyEnv(readSettings({ enabled: false }), { enabled: '1' }).enabled).toBe(true)
+  expect(applyEnv(base, { threshold: 'lots' }).threshold).toBe(300000)
 })

@@ -15,6 +15,25 @@ export function readSettings(options: Readonly<Record<string, unknown>>): Settin
   }
 }
 
+// Per-project overrides: Claude Code reads plugin options only from user, --settings
+// and managed settings, so a project sets these in the `env` block of its
+// .claude/settings.json (or settings.local.json) instead.
+export const ENV_KEYS = { enabled: 'SELF_COMPACT_ENABLED', threshold: 'SELF_COMPACT_THRESHOLD', step: 'SELF_COMPACT_STEP' } as const
+
+export function applyEnv(s: Settings, env: { enabled?: string; threshold?: string; step?: string }): Settings {
+  const num = (v: string | undefined, d: number) => {
+    const n = v === undefined ? NaN : Number(v.replace(/[_,]/g, ''))
+    return Number.isFinite(n) && n > 0 ? n : d
+  }
+  const off = env.enabled !== undefined && /^(0|false|off|no)$/i.test(env.enabled.trim())
+  const on = env.enabled !== undefined && /^(1|true|on|yes)$/i.test(env.enabled.trim())
+  return {
+    enabled: off ? false : on ? true : s.enabled,
+    threshold: num(env.threshold, s.threshold),
+    step: num(env.step, s.step),
+  }
+}
+
 // The real context size of the last main-conversation model call recorded in a
 // transcript chunk: input + cache read + cache write tokens of its usage.
 // `text` is the tail of the transcript file; a first partial line is skipped.

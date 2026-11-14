@@ -13,8 +13,8 @@
 import type { Register } from 'claude-code'
 import {
   INPUT_SCHEMA, PLUGIN, TOOL, TOOL_DESCRIPTION, TOOL_FULL,
-  boundarySince, carryRow, failureRow, isOneShot, lastContextFromTail, markDecision, markLine,
-  readSettings, summariserInstructions,
+  applyEnv, boundarySince, carryRow, failureRow, isOneShot, lastContextFromTail, markDecision,
+  markLine, readSettings, summariserInstructions,
 } from './lib'
 import type { Settings } from './lib'
 
@@ -95,7 +95,7 @@ async function appendLog($: any, entry: Record<string, unknown>): Promise<void> 
 }
 
 async function maybeMark($: any): Promise<string | undefined> {
-  if (S.pending || S.running) return undefined
+  if (!S.settings.enabled || S.pending || S.running) return undefined
   const ctx = await readContext($)
   if (ctx === undefined) return undefined
   const d = markDecision(ctx, S.nextMarkAt, S.settings)
@@ -170,6 +170,12 @@ async function runCompaction($: any, req: Request): Promise<void> {
 }
 
 async function startSession($: any, isInteractive: boolean): Promise<void> {
+  S.settings = applyEnv(S.settings, {
+    enabled: await $.env.get('SELF_COMPACT_ENABLED'),
+    threshold: await $.env.get('SELF_COMPACT_THRESHOLD'),
+    step: await $.env.get('SELF_COMPACT_STEP'),
+  })
+  if (!S.settings.enabled) return
   S.sessionId = await $.session.id()
   S.stateDir = `${await configDir($)}/${PLUGIN}`
   if (!isInteractive) {
