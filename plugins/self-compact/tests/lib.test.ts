@@ -72,6 +72,9 @@ test('the row carries the machine clock and the time since the previous compacti
 test('the summariser is told to cover what happened after the note was written', async () => {
   const text = summariserInstructions()
   expect(text.includes('do not restate it')).toBe(true)
+  expect(text.includes('keep the summary short')).toBe(false)
+  expect(text.includes('write the summary in full')).toBe(true)
+  expect(text.includes('where it states something the conversation contradicts')).toBe(true)
   expect(text.includes('went on after it')).toBe(true)
   expect(text.includes('cover all of it in full')).toBe(true)
 })
