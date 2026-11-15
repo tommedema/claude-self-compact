@@ -1,6 +1,6 @@
 {
   "name": "self-compact",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Lets Claude compact its own session at a natural checkpoint, carrying a note over verbatim, with a soft context-size mark and a cost stats command",
   "author": { "name": "Tom Medema" },
   "license": "MIT",
