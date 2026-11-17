@@ -133,7 +133,13 @@ claude plugin test plugins/self-compact
 python3 plugins/self-compact/tests/e2e.py
 ```
 
+```bash
+python3 plugins/self-compact/tests/e2e-queued.py
+```
+
 The second runs two real compactions in a small headless session (about two minutes, a few cents) and checks the note, the clock, the last report, the pending request and the log. It sets `SELF_COMPACT_HOME` to a temporary folder, which moves the plugin's state files and log there, so nothing is written to `~/.claude/self-compact`. The stats command reads only the log rows of the session it is asked about.
+
+The third sends a message while a compaction runs and checks that the first request after it already carries the note (under a minute). Such a message is queued and submitted the moment the compaction ends, a few milliseconds before the plugin puts the note back, so the plugin holds that prompt until the note is in.
 
 ## Surfaces
 

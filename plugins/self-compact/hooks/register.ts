@@ -44,6 +44,9 @@ const S: {
   oneShot: boolean
   pending?: Request // asked for, waiting for the turn to end
   running: boolean // from the turn's end to the compaction's outcome
+  noted?: Promise<void> // from the turn's end until the note (carry or failure) is in the conversation
+  settle?: () => void
+  runFrom?: number // when the turn that the compaction waited for ended
   ended?: { turnId: string; index: number } // the main loop's last step, when it ended the turn (no tool calls)
   cut?: string // the turn this plugin ended so a waiting compaction could run
   nextMarkAt?: number
@@ -197,6 +200,7 @@ async function runCompaction($: any, req: Request): Promise<void> {
   } else {
     await note($, failureRow(outcome.reason, !!req.then, !!req.held))
   }
+  noteIsIn()
   S.running = false
   await saveState($, { last: { ...outcome, requestedAt: req.requestedAt, finishedAt: Date.now() } })
   await appendLog($, {
@@ -320,9 +324,38 @@ async function endOfTurn($: any, reason: string, turnId: string): Promise<void> 
     return
   }
   S.running = true
+  S.runFrom = Date.now()
+  S.noted = new Promise<void>((resolve) => { S.settle = resolve })
   $.clock.after(50, () => {
-    void runCompaction($, req)
+    void runCompaction($, req).finally(noteIsIn)
   })
+}
+
+function noteIsIn(): void {
+  S.settle?.()
+  S.settle = undefined
+  S.noted = undefined
+}
+
+// A message sent while the compaction runs (typed, or a background task's notice)
+// is queued, and is submitted the moment the compaction ends: before the call that
+// ran it returns to this plugin, so before the carry note is in. Its turn would
+// start without the note. So its prompt.submit waits for the note: the turn's
+// messages are gathered after that (by turn.start they already are). Only once the
+// compaction is in the transcript: a prompt submitted before it began must not
+// wait, as the queued /compact runs only once the session is idle. (The plugin's
+// own command.run hooks do not hear the /compact it runs, so the transcript is
+// what says it is done.)
+async function holdForNote($: any): Promise<void> {
+  const noted = S.noted
+  const from = S.runFrom
+  if (!noted || from === undefined) return
+  const path = await findTranscript($)
+  const text = path ? await tail($, path, 2_000_000) : undefined
+  if (!text || !compactionsInTail(text).some((c) => c.at >= from)) return
+  let timer: { cancel: () => void } | undefined
+  await Promise.race([noted, new Promise<void>((resolve) => { timer = $.clock.after(30_000, () => resolve()) })])
+  timer?.cancel()
 }
 
 async function stats($: any, args: string): Promise<{ text: string }> {
@@ -399,8 +432,12 @@ export const register: Register = (on, options) => {
   // The soft mark, after any tool call of the main loop...
   on('tool.call', async ($, e, next) => withMarkOnTool($, e, await next(e))).catch(($, e, next) => next(e))
 
-  // ...and with each prompt the user sends.
-  on('prompt.submit', async ($, e, next) => next(await withMarkOnPrompt($, e))).catch(($, e, next) => next(e))
+  // ...and with each prompt the user sends, which waits for the carry note if it
+  // arrived while a compaction ran (holdForNote).
+  on('prompt.submit', async ($, e, next) => {
+    await holdForNote($)
+    return next(await withMarkOnPrompt($, e))
+  }).catch(($, e, next) => next(e))
 
   // /compact-stats: the stats script over this session's transcript.
   on('command.run', { command: 'compact-stats' }, async ($, e) => stats($, e.args ?? ''))
