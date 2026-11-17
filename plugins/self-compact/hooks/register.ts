@@ -18,11 +18,13 @@ import type { Register } from 'claude-code'
 import {
   INPUT_SCHEMA, PLUGIN, TOOL, TOOL_DESCRIPTION, TOOL_FULL,
   applyEnv, boundarySince, carryRow, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision,
-  markLine, readSettings, summariserInstructions,
+  heldLine, markLine, nextPrompt, readSettings, summariserInstructions,
 } from './lib'
 import type { Settings } from './lib'
 
-type Request = { carry: string; then?: string; requestedAt: number; contextBefore?: number }
+// held: the message of a Stop hook (such as /goal) whose block the plugin lifted so the
+// turn could end for the compaction; it is sent on as the next prompt.
+type Request = { carry: string; then?: string; requestedAt: number; contextBefore?: number; held?: string }
 type Outcome =
   | { ok: true; via: string; tokensBefore?: number; tokensAfter?: number; usage?: unknown }
   | { ok: false; via: string; reason: string }
@@ -175,24 +177,46 @@ async function runCompaction($: any, req: Request): Promise<void> {
     const now = Date.now()
     const sincePrevMs = S.lastCompactionAt !== undefined && now > S.lastCompactionAt ? now - S.lastCompactionAt : undefined
     S.lastCompactionAt = now
-    await note($, carryRow(req.carry, req.contextBefore, req.then, { now: new Date(now), sincePrevMs }, report))
+    await note($, carryRow(req.carry, req.contextBefore, req.then, { now: new Date(now), sincePrevMs }, report, req.held))
   } else {
-    await note($, failureRow(outcome.reason, !!req.then))
+    await note($, failureRow(outcome.reason, !!req.then, !!req.held))
   }
   S.running = false
   await saveState($, { last: { ...outcome, requestedAt: req.requestedAt, finishedAt: Date.now() } })
   await appendLog($, {
     at: new Date().toISOString(), sessionId: S.sessionId, transcriptPath: S.transcriptPath, ...outcome,
     contextBefore: req.contextBefore, requestedAt: new Date(req.requestedAt).toISOString(),
-    durationMs: Date.now() - startedAt, carryChars: req.carry.length, reportChars: report?.length ?? 0, hasThen: !!req.then,
+    durationMs: Date.now() - startedAt, carryChars: req.carry.length, reportChars: report?.length ?? 0, hasThen: !!req.then, heldStopHook: !!req.held,
   })
-  if (req.then) {
+  const prompt = nextPrompt(req.then, req.held)
+  if (prompt) {
     try {
-      await $.prompt.submit({ text: req.then })
+      await $.prompt.submit({ text: prompt })
     } catch (err) {
-      $.ui.log(`${PLUGIN}: could not submit the then prompt: ${errText(err)}`)
+      $.ui.log(`${PLUGIN}: could not submit the next prompt: ${errText(err)}`)
     }
   }
+}
+
+// A compaction can only run once the turn has ended. A Stop hook that blocks the
+// end (such as /goal, which keeps a session working until its condition is met)
+// would hold it off for as long as it keeps blocking: hours in a long session.
+// Once the hooks beneath have run they have blocked (what this hook returns does
+// not lift it), so this takes two stops. At the first stop after the request the
+// hooks run as usual; if one blocks, its message is kept and Claude is told to end
+// the turn again at once. At the next stop the hooks are not asked again, so the
+// turn ends, the compaction runs, and the kept message is sent as the next prompt:
+// the session carries on as the hook asked, on a compacted context, and the hook
+// decides again when that turn ends. Stops with no compaction waiting are untouched.
+async function stopWhilePending($: any, e: any, next: any): Promise<any> {
+  const req = S.pending
+  if (!req || S.running) return next(e)
+  if (req.held !== undefined) return {}
+  const r = await next(e)
+  if (!r || typeof r.block !== 'string' || r.preventContinuation) return r
+  req.held = r.block
+  await saveState($, {})
+  return { ...r, additionalContext: [...(r.additionalContext ?? []), heldLine()] }
 }
 
 async function startSession($: any, isInteractive: boolean): Promise<void> {
@@ -240,7 +264,7 @@ async function requestCompaction($: any, e: any): Promise<any> {
   if (S.running) return { deny: 'A compaction is already running. Nothing changed.' }
   const replaced = !!S.pending
   const contextBefore = await readContext($)
-  S.pending = { carry, then, requestedAt: Date.now(), contextBefore }
+  S.pending = { carry, then, requestedAt: Date.now(), contextBefore, held: S.pending?.held }
   await saveState($, {})
   const size = contextBefore ? ` Context now: ${contextBefore.toLocaleString('en-US')} tokens.` : ''
   return {
@@ -248,6 +272,7 @@ async function requestCompaction($: any, e: any): Promise<any> {
       `Compaction scheduled${replaced ? ' (this replaces the earlier request)' : ''}: it runs as soon as this turn ends.${size}`,
       'End your turn now with one short line; do not start new work in this turn.',
       `After the compaction your carry note comes back word for word${then ? ', then your `then` instruction is sent as the next prompt' : ''}.`,
+      'If a Stop hook such as /goal asks to keep going, you are told to end the turn once more; then the compaction runs and that hook\'s message is sent after it as the next prompt.',
     ].join(' '),
   }
 }
@@ -311,6 +336,9 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__self-compact__compact' }, async ($, e) => requestCompaction($, e)).catch(($, e, next) =>
     next.called ? next(e) : { deny: `${PLUGIN}: the request failed, nothing changed.` },
   )
+
+  // A Stop hook that would keep the turn going does not hold a waiting compaction off.
+  on('classic.Stop' as any, async ($: any, e: any, next: any) => stopWhilePending($, e, next))
 
   // At the end of the main loop's turn, run what was asked for.
   on('turn.complete', async ($, e, next) => {

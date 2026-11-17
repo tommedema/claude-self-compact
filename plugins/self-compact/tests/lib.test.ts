@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { applyEnv, boundarySince, carryRow, clockStamp, isOneShot, lastContextFromTail, lastReportFromTail, markDecision, readSettings, span, summariserInstructions } from '../hooks/lib'
+import { applyEnv, boundarySince, carryRow, clockStamp, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision, nextPrompt, readSettings, span, summariserInstructions } from '../hooks/lib'
 
 const call = (cr: number, cw: number, inp = 2, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'assistant', message: { model: 'm', usage: { input_tokens: inp, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, output_tokens: 9 } }, ...extra })
@@ -102,4 +102,22 @@ test('the last report before the compact call is found word for word', async () 
   expect(row.includes(`<last-report>\n${report}\n</last-report>`)).toBe(true)
   expect(row.indexOf('</carry>') < row.indexOf('<last-report>') && row.indexOf('</last-report>') < row.indexOf('<then>')).toBe(true)
   expect(carryRow('note', undefined, undefined).includes('<last-report>')).toBe(false)
+})
+
+test('a Stop hook held off for the compaction is passed on as the next prompt', async () => {
+  const goal = '[Goal not met] run the remaining checks'
+  expect(nextPrompt('go on', undefined)).toBe('go on')
+  expect(nextPrompt(undefined, undefined)).toBe(undefined)
+  const alone = nextPrompt(undefined, goal) ?? ''
+  expect(alone.includes(`<stop-hook>\n${goal}\n</stop-hook>`)).toBe(true)
+  const both = nextPrompt('go on', goal) ?? ''
+  expect(both.startsWith('go on\n')).toBe(true)
+  expect(both.includes(goal)).toBe(true)
+  const row = carryRow('note', undefined, undefined, undefined, undefined, goal)
+  expect(row.includes(`<stop-hook>\n${goal}\n</stop-hook>`)).toBe(true)
+  expect(carryRow('note', undefined, 'go on').includes('<stop-hook>')).toBe(false)
+  expect(failureRow('x', true, true).includes('Your `then` instruction and the message of the Stop hook that asked to keep going follow as the next prompt.')).toBe(true)
+  expect(failureRow('x', false, true).includes('The message of the Stop hook that asked to keep going follows as the next prompt.')).toBe(true)
+  expect(failureRow('x', true).includes('Your `then` instruction follows as the next prompt.')).toBe(true)
+  expect(failureRow('x', false).includes('follow')).toBe(false)
 })

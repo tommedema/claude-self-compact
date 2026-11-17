@@ -147,6 +147,7 @@ export const TOOL_DESCRIPTION = [
   'carry: your own note, re-inserted word for word after the summary. Put in it: open threads and the next step of each; decisions pending with the user; what you last told the user; background tasks still running (ids, what they do, what to do when they finish); standing rules the user gave in this session; key paths. Complete but brief.',
   'then: optional. Sent as the next prompt after the compaction so you carry on by yourself (an unattended session). Leave it out to wait for the user.',
   '',
+  'A Stop hook that keeps the turn going (such as /goal) does not hold the compaction off: you are told to end the turn once more, then the compaction runs and that hook\'s message comes back as the next prompt.',
   'If the compaction cannot be done here the call returns an error and nothing changes.',
 ].join('\n')
 
@@ -196,7 +197,7 @@ export function span(ms: number): string {
 // its own estimate and is copied forward from note to note, so the row says
 // what the machine's clock read, and how long ago the previous compaction was.
 // `report` is Claude's last report, word for word (lastReportFromTail).
-export function carryRow(carry: string, before: number | undefined, then: string | undefined, when?: { now: Date; sincePrevMs?: number }, report?: string): string {
+export function carryRow(carry: string, before: number | undefined, then: string | undefined, when?: { now: Date; sincePrevMs?: number }, report?: string, held?: string): string {
   const size = before ? ` (context was ${before.toLocaleString('en-US')} tokens)` : ''
   const prev = when?.sincePrevMs !== undefined ? `, ${span(when.sincePrevMs)} after the previous compaction` : ''
   const clock = when ? ` The machine's clock at this compaction: ${clockStamp(when.now)} local time${prev}; where a time in the note disagrees, the clock is right.` : ''
@@ -212,14 +213,42 @@ export function carryRow(carry: string, before: number | undefined, then: string
     ...(then
       ? ['', 'Your `then` instruction, also sent as the next prompt (if something else arrives first, carry on with it anyway; when the prompt itself arrives, do not redo work already done):', '', '<then>', then, '</then>']
       : []),
+    ...(held ? ['', heldIntro(), '', '<stop-hook>', held, '</stop-hook>'] : []),
   ].join('\n')
 }
 
-export function failureRow(reason: string, hasThen: boolean): string {
+// A Stop hook (such as /goal) that would have kept the turn going while a
+// compaction waited for it to end: the plugin let the turn end, and passes the
+// hook's message on so the session carries on as that hook asked.
+function heldIntro(): string {
+  return 'When you ended the turn for the compaction, a Stop hook (such as /goal) asked to keep going. The plugin let the turn end so the compaction could run, and sends that hook\'s message as the next prompt (if something else arrives first, carry on with it anyway; when the prompt itself arrives, do not redo work already done):'
+}
+
+// Told to Claude with the Stop hook's block when a compaction is waiting.
+export function heldLine(): string {
+  return `${PLUGIN} plugin: the compaction you asked for is still waiting for your turn to end. End your turn again now with one short line, and do not act on the Stop hook's message yet: this time the turn ends, the compaction runs, and that message is sent to you as the next prompt.`
+}
+
+// What is submitted after the compaction, done or not: the `then` instruction
+// and the held Stop hook's message, in one prompt.
+export function nextPrompt(then: string | undefined, held: string | undefined): string | undefined {
+  if (!held) return then
+  return [
+    ...(then ? [then, ''] : []),
+    'A Stop hook (such as /goal) asked to keep going when you ended the turn for the compaction; the plugin let the turn end so the compaction could run. Its message, word for word (if you already did what it asks, do not redo it):',
+    '',
+    '<stop-hook>',
+    held,
+    '</stop-hook>',
+  ].join('\n')
+}
+
+export function failureRow(reason: string, hasThen: boolean, hasHeld = false): string {
+  const follows = [hasThen ? 'your `then` instruction' : '', hasHeld ? 'the message of the Stop hook that asked to keep going' : ''].filter(Boolean).join(' and ')
   return [
     `[self-compact] The compaction you asked for did not happen: ${reason}`,
     'The conversation is unchanged, so nothing was lost. Do not ask again in this turn.',
-    ...(hasThen ? ['Your `then` instruction follows as the next prompt.'] : []),
+    ...(follows ? [`${follows.charAt(0).toUpperCase()}${follows.slice(1)} follow${hasThen && hasHeld ? '' : 's'} as the next prompt.`] : []),
   ].join('\n')
 }
 
