@@ -10,15 +10,21 @@
 //   the next prompt.
 // - While a request waits for the turn to end, the session's state file has
 //   `pending` set: a Stop hook can read it and stand aside for that stop, so
-//   the note is not made stale by work the hook would ask for (README).
+//   the note is not made stale by work the hook would ask for (README). A Stop
+//   hook that blocks anyway (/goal) does not hold the compaction off: the turn
+//   is ended at its next model request, and the hook's message is sent on.
+// - No classic.* or session.compact hooks: on a machine with managed settings,
+//   or a Team or Enterprise plan, cc-plugin-sec-default passes those events on
+//   past installed plugins (and tells the session so). What they gave is read
+//   from the turn's steps and the transcript instead.
 // - A soft mark: after tool calls and user prompts, the real context size of the
 //   last call is read from the transcript; past the threshold Claude gets one
 //   line, once, then again only every further `step` tokens. It never blocks.
 import type { Register } from 'claude-code'
 import {
   INPUT_SCHEMA, PLUGIN, TOOL, TOOL_DESCRIPTION, TOOL_FULL,
-  applyEnv, boundarySince, carryRow, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision,
-  heldLine, markLine, nextPrompt, readSettings, summariserInstructions,
+  applyEnv, carryRow, compactionsInTail, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision,
+  markLine, nextPrompt, readSettings, stopFeedbackFromTail, summariserInstructions,
 } from './lib'
 import type { Settings } from './lib'
 
@@ -38,8 +44,8 @@ const S: {
   oneShot: boolean
   pending?: Request // asked for, waiting for the turn to end
   running: boolean // from the turn's end to the compaction's outcome
-  inFlight?: { instructions: string } // running through the /compact command
-  hookOutcome?: Outcome
+  ended?: { turnId: string; index: number } // the main loop's last step, when it ended the turn (no tool calls)
+  cut?: string // the turn this plugin ended so a waiting compaction could run
   nextMarkAt?: number
   lastCompactionAt?: number // when the latest compaction of this session finished, by anyone
 } = { settings: readSettings({}), oneShot: false, running: false }
@@ -64,7 +70,7 @@ async function tail($: any, path: string, bytes: number): Promise<string | undef
 async function findTranscript($: any): Promise<string | undefined> {
   if (S.transcriptPath) return S.transcriptPath
   try {
-    const id = S.sessionId ?? (await $.session.id())
+    const id = S.sessionId ?? (S.sessionId = await $.session.id())
     const r = await $.process.run(['/bin/sh', '-c', 'ls -t "$1"/projects/*/"$2".jsonl 2>/dev/null | head -1', 'sh', await configDir($), id])
     const p = r.stdout.trim()
     if (p) S.transcriptPath = p
@@ -138,21 +144,30 @@ async function note($: any, text: string): Promise<void> {
 }
 
 async function compactViaCommand($: any, instructions: string, startedAt: number, first: string): Promise<Outcome> {
-  S.inFlight = { instructions }
-  S.hookOutcome = undefined
   try {
     await $.command.run({ command: 'compact', args: instructions })
-    if (S.hookOutcome) return S.hookOutcome
+    // The outcome is read from the transcript: on a machine with managed settings
+    // (or a Team or Enterprise plan) the built-in cc-plugin-sec-default passes the
+    // session.compact event on past installed plugins, so no hook of ours hears it.
     const path = await findTranscript($)
     const text = path ? await tail($, path, 4_000_000) : undefined
-    return text && boundarySince(text, startedAt)
-      ? { ok: true, via: '/compact' }
+    const done = text ? compactionsInTail(text).filter((c) => c.at >= startedAt).pop() : undefined
+    return done
+      ? { ok: true, via: '/compact', tokensBefore: done.preTokens, tokensAfter: done.postTokens }
       : { ok: false, via: '/compact', reason: 'the /compact command ran but did not compact the conversation' }
   } catch (err) {
     return { ok: false, via: '/compact', reason: `${errText(err)} (and $.session.compact: ${first})` }
-  } finally {
-    S.inFlight = undefined
   }
+}
+
+// When the session was last compacted before `beforeMs`, by anyone (automatic,
+// typed or this plugin): the newer of the state file's time and the transcript's.
+async function previousCompactionAt($: any, beforeMs: number): Promise<number | undefined> {
+  const path = await findTranscript($)
+  const text = path ? await tail($, path, 4_000_000) : undefined
+  const seen = text ? compactionsInTail(text).filter((c) => c.at < beforeMs).pop()?.at : undefined
+  const known = S.lastCompactionAt !== undefined && S.lastCompactionAt < beforeMs ? S.lastCompactionAt : undefined
+  return seen === undefined ? known : known === undefined ? seen : Math.max(seen, known)
 }
 
 async function runCompaction($: any, req: Request): Promise<void> {
@@ -175,7 +190,8 @@ async function runCompaction($: any, req: Request): Promise<void> {
   if (outcome.ok) {
     S.nextMarkAt = undefined
     const now = Date.now()
-    const sincePrevMs = S.lastCompactionAt !== undefined && now > S.lastCompactionAt ? now - S.lastCompactionAt : undefined
+    const prev = await previousCompactionAt($, startedAt)
+    const sincePrevMs = prev !== undefined && now > prev ? now - prev : undefined
     S.lastCompactionAt = now
     await note($, carryRow(req.carry, req.contextBefore, req.then, { now: new Date(now), sincePrevMs }, report, req.held))
   } else {
@@ -200,23 +216,38 @@ async function runCompaction($: any, req: Request): Promise<void> {
 
 // A compaction can only run once the turn has ended. A Stop hook that blocks the
 // end (such as /goal, which keeps a session working until its condition is met)
-// would hold it off for as long as it keeps blocking: hours in a long session.
-// Once the hooks beneath have run they have blocked (what this hook returns does
-// not lift it), so this takes two stops. At the first stop after the request the
-// hooks run as usual; if one blocks, its message is kept and Claude is told to end
-// the turn again at once. At the next stop the hooks are not asked again, so the
-// turn ends, the compaction runs, and the kept message is sent as the next prompt:
-// the session carries on as the hook asked, on a compacted context, and the hook
-// decides again when that turn ends. Stops with no compaction waiting are untouched.
-async function stopWhilePending($: any, e: any, next: any): Promise<any> {
+// keeps the same turn going, and would hold the compaction off for as long as it
+// keeps blocking: hours in a long session. Classic Stop hooks cannot be hooked
+// everywhere (cc-plugin-sec-default passes classic events on past installed
+// plugins), so this is seen from the turn's steps instead: while a compaction
+// waits, a model request that starts after a step that ended the turn means
+// something kept the turn going. Then that step is not sent, the turn is ended
+// (no interruption marker), the compaction runs, and the Stop hook's message,
+// read from the transcript, is sent as the next prompt: the session carries on as
+// the hook asked, on a compacted context, and the hook decides again when that
+// turn ends. Turns with no compaction waiting are untouched.
+async function cutForCompaction($: any, turnId: string): Promise<boolean> {
   const req = S.pending
-  if (!req || S.running) return next(e)
-  if (req.held !== undefined) return {}
-  const r = await next(e)
-  if (!r || typeof r.block !== 'string' || r.preventContinuation) return r
-  req.held = r.block
+  if (!req || S.running) return false
+  let held: string | undefined
+  for (const waitMs of [0, 150, 500]) {
+    if (waitMs) await new Promise<void>((resolve) => $.clock.after(waitMs, () => resolve()))
+    const path = await findTranscript($)
+    const text = path ? await tail($, path, 1_000_000) : undefined
+    held = text ? stopFeedbackFromTail(text, req.requestedAt) : undefined
+    if (held) break
+  }
+  req.held = held ?? 'A Stop hook (or something else) kept the turn going after you ended it for the compaction; its message could not be read from the transcript. Carry on with the work in progress.'
+  S.cut = turnId
   await saveState($, {})
-  return { ...r, additionalContext: [...(r.additionalContext ?? []), heldLine()] }
+  try {
+    await $.turn.abort({ turnId })
+    return true
+  } catch (err) {
+    S.cut = undefined
+    $.ui.log(`${PLUGIN}: could not end the turn for the waiting compaction: ${errText(err)}`)
+    return false
+  }
 }
 
 async function startSession($: any, isInteractive: boolean): Promise<void> {
@@ -272,16 +303,18 @@ async function requestCompaction($: any, e: any): Promise<any> {
       `Compaction scheduled${replaced ? ' (this replaces the earlier request)' : ''}: it runs as soon as this turn ends.${size}`,
       'End your turn now with one short line; do not start new work in this turn.',
       `After the compaction your carry note comes back word for word${then ? ', then your `then` instruction is sent as the next prompt' : ''}.`,
-      'If a Stop hook such as /goal asks to keep going, you are told to end the turn once more; then the compaction runs and that hook\'s message is sent after it as the next prompt.',
+      'If a Stop hook such as /goal asks to keep going, the plugin ends the turn there, the compaction runs, and that hook\'s message is sent after it as the next prompt.',
     ].join(' '),
   }
 }
 
-async function endOfTurn($: any, reason: string): Promise<void> {
+async function endOfTurn($: any, reason: string, turnId: string): Promise<void> {
+  const cut = S.cut === turnId
+  S.cut = undefined
   const req = S.pending
   if (!req) return
   S.pending = undefined
-  if (reason !== 'answer') {
+  if (reason !== 'answer' && !(cut && reason === 'aborted')) {
     await saveState($, {})
     await note($, failureRow(`the turn ended with "${reason}" (interrupted or failed), so the compaction was cancelled.`, false))
     return
@@ -320,12 +353,16 @@ export const register: Register = (on, options) => {
   S.settings = readSettings(options)
   if (!S.settings.enabled) return
 
-  // The transcript path, from the classic SessionStart event (startup, resume, clear, compact).
-  on('classic.SessionStart' as any, async ($: any, e: any, next: any) => {
-    if (typeof e?.transcript_path === 'string') S.transcriptPath = e.transcript_path
-    if (e?.source === 'compact' || e?.source === 'clear') S.nextMarkAt = undefined
+  // A /clear goes on under a new session id and transcript, with no session.start.
+  on('session.end', async ($, e, next) => {
+    if (e.reason === 'clear') {
+      S.sessionId = undefined
+      S.transcriptPath = undefined
+      S.nextMarkAt = undefined
+      S.pending = undefined
+    }
     return next(e)
-  }).catch(($: any, e: any, next: any) => next(e))
+  })
 
   on('session.start', async ($, e, next) => {
     await startSession($, e.isInteractive)
@@ -338,43 +375,26 @@ export const register: Register = (on, options) => {
   )
 
   // A Stop hook that would keep the turn going does not hold a waiting compaction off.
-  on('classic.Stop' as any, async ($: any, e: any, next: any) => stopWhilePending($, e, next))
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) S.ended = undefined
+    return next(e)
+  })
+  on('turn.step', async function* ($, e, next) {
+    const main = e.agentId === undefined
+    if (main && S.pending && S.ended?.turnId === e.turnId && (await cutForCompaction($, e.turnId))) {
+      return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: null, usage: null }
+    }
+    const r = yield* next(e)
+    if (main) S.ended = r.toolUses.length === 0 && r.stopReason === 'end_turn' ? { turnId: e.turnId, index: e.index } : undefined
+    return r
+  })
 
   // At the end of the main loop's turn, run what was asked for.
   on('turn.complete', async ($, e, next) => {
     const r = await next(e)
-    if (e.agentId === undefined) await endOfTurn($, e.reason)
+    if (e.agentId === undefined) await endOfTurn($, e.reason, e.turnId)
     return r
   })
-
-  // Learn the outcome of a /compact this plugin started; any compaction resets the mark.
-  on('session.compact', async ($, e, next) => {
-    if (e.trigger === 'precompute' || e.agentId !== undefined) return next(e)
-    const mine = S.inFlight !== undefined && e.instructions === S.inFlight.instructions
-    try {
-      const c: any = await next(e)
-      const ok = c?.skip === undefined
-      if (mine) {
-        S.hookOutcome = ok
-          ? { ok: true, via: '/compact', tokensBefore: c?.tokensBefore, tokensAfter: c?.tokensAfter, usage: c?.usage }
-          : { ok: false, via: '/compact', reason: String(c.skip) }
-      } else if (ok) {
-        await appendLog($, { at: new Date().toISOString(), sessionId: S.sessionId, transcriptPath: S.transcriptPath, ok: true, via: e.trigger, tokensBefore: c?.tokensBefore, tokensAfter: c?.tokensAfter, usage: c?.usage })
-      }
-      if (ok) {
-        S.nextMarkAt = undefined
-        // An automatic or typed compaction counts too; one of this plugin's own is timed in runCompaction.
-        if (!mine) {
-          S.lastCompactionAt = Date.now()
-          await saveState($, {})
-        }
-      }
-      return c
-    } catch (err) {
-      if (mine) S.hookOutcome = { ok: false, via: '/compact', reason: errText(err) }
-      throw err
-    }
-  }).catch(($, e, next) => next(e))
 
   // The soft mark, after any tool call of the main loop...
   on('tool.call', async ($, e, next) => withMarkOnTool($, e, await next(e))).catch(($, e, next) => next(e))

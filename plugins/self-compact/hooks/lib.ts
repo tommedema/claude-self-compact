@@ -66,18 +66,6 @@ export function lastContextFromTail(text: string): number | undefined {
   return undefined
 }
 
-// Whether a compact_boundary row newer than `sinceMs` is in the transcript tail.
-export function boundarySince(text: string, sinceMs: number): boolean {
-  for (const line of text.split('\n')) {
-    if (!line.includes('"compact_boundary"')) continue
-    try {
-      const row = JSON.parse(line)
-      if (row?.subtype === 'compact_boundary' && Date.parse(row.timestamp) >= sinceMs) return true
-    } catch {}
-  }
-  return false
-}
-
 // The last report Claude wrote before it asked for the compaction: the newest
 // main-conversation text of at least `minChars` characters that comes before
 // its latest compact tool call in a transcript chunk (short progress lines are
@@ -121,6 +109,55 @@ export function lastReportFromTail(text: string, minChars = 400, maxChars = 20_0
   return undefined
 }
 
+// The main conversation's compactions in a transcript tail, oldest first: when
+// each finished (the boundary row's time) and the sizes the engine recorded.
+export function compactionsInTail(text: string): { at: number; preTokens?: number; postTokens?: number }[] {
+  const found: { at: number; preTokens?: number; postTokens?: number }[] = []
+  for (const line of text.split('\n')) {
+    if (!line.includes('"compact_boundary"')) continue
+    try {
+      const row = JSON.parse(line)
+      if (row?.subtype !== 'compact_boundary' || row.isSidechain) continue
+      const at = Date.parse(row.timestamp)
+      if (!Number.isFinite(at)) continue
+      const m = row.compactMetadata ?? {}
+      found.push({ at, preTokens: typeof m.preTokens === 'number' ? m.preTokens : undefined, postTokens: typeof m.postTokens === 'number' ? m.postTokens : undefined })
+    } catch {}
+  }
+  return found
+}
+
+// The message of the newest Stop hook block in a transcript tail since `sinceMs`:
+// the engine records it as a hook_blocking_error attachment and as a meta user
+// row "Stop hook feedback:\n<message>".
+export function stopFeedbackFromTail(text: string, sinceMs: number): string | undefined {
+  let found: string | undefined
+  for (const line of text.split('\n')) {
+    if (!line.includes('Stop')) continue
+    let row: any
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row?.isSidechain || !(Date.parse(row?.timestamp) >= sinceMs)) continue
+    const a = row.attachment
+    if (row.type === 'attachment' && a?.type === 'hook_blocking_error' && a.hookEvent === 'Stop') {
+      const b = a.blockingError
+      const msg = typeof b === 'string' ? b : typeof b?.blockingError === 'string' ? b.blockingError : undefined
+      if (msg?.trim()) found = msg.trim()
+      continue
+    }
+    if (row.type === 'user' && row.isMeta) {
+      const c = row.message?.content
+      const t = typeof c === 'string' ? c : Array.isArray(c) ? c.map((x: any) => (typeof x?.text === 'string' ? x.text : '')).join('') : ''
+      const m = /^Stop hook feedback:\s*([\s\S]+)$/.exec(t.trim())
+      if (m?.[1]?.trim()) found = m[1].trim()
+    }
+  }
+  return found
+}
+
 // Soft mark: once when the context first reaches the threshold, then again only
 // after it has grown a further `step` tokens past the size it was marked at.
 // Returns the new `nextAt` and whether to mark now.
@@ -147,7 +184,7 @@ export const TOOL_DESCRIPTION = [
   'carry: your own note, re-inserted word for word after the summary. Put in it: open threads and the next step of each; decisions pending with the user; what you last told the user; background tasks still running (ids, what they do, what to do when they finish); standing rules the user gave in this session; key paths. Complete but brief.',
   'then: optional. Sent as the next prompt after the compaction so you carry on by yourself (an unattended session). Leave it out to wait for the user.',
   '',
-  'A Stop hook that keeps the turn going (such as /goal) does not hold the compaction off: you are told to end the turn once more, then the compaction runs and that hook\'s message comes back as the next prompt.',
+  'A Stop hook that keeps the turn going (such as /goal) does not hold the compaction off: the plugin ends the turn when that hook asks to go on, the compaction runs, and that hook\'s message comes back as the next prompt.',
   'If the compaction cannot be done here the call returns an error and nothing changes.',
 ].join('\n')
 
@@ -222,11 +259,6 @@ export function carryRow(carry: string, before: number | undefined, then: string
 // hook's message on so the session carries on as that hook asked.
 function heldIntro(): string {
   return 'When you ended the turn for the compaction, a Stop hook (such as /goal) asked to keep going. The plugin let the turn end so the compaction could run, and sends that hook\'s message as the next prompt (if something else arrives first, carry on with it anyway; when the prompt itself arrives, do not redo work already done):'
-}
-
-// Told to Claude with the Stop hook's block when a compaction is waiting.
-export function heldLine(): string {
-  return `${PLUGIN} plugin: the compaction you asked for is still waiting for your turn to end. End your turn again now with one short line, and do not act on the Stop hook's message yet: this time the turn ends, the compaction runs, and that message is sent to you as the next prompt.`
 }
 
 // What is submitted after the compaction, done or not: the `then` instruction

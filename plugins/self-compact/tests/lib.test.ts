@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { applyEnv, boundarySince, carryRow, clockStamp, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision, nextPrompt, readSettings, span, summariserInstructions } from '../hooks/lib'
+import { applyEnv, carryRow, compactionsInTail, clockStamp, failureRow, isOneShot, lastContextFromTail, lastReportFromTail, markDecision, nextPrompt, readSettings, span, stopFeedbackFromTail, summariserInstructions } from '../hooks/lib'
 
 const call = (cr: number, cw: number, inp = 2, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'assistant', message: { model: 'm', usage: { input_tokens: inp, cache_read_input_tokens: cr, cache_creation_input_tokens: cw, output_tokens: 9 } }, ...extra })
@@ -14,8 +14,10 @@ test('context is input + cache read + cache write of the newest main call', asyn
 test('a compaction newer than every call leaves the size unknown', async () => {
   expect(lastContextFromTail([call(300000, 1), boundary('2026-11-14T00:00:00Z')].join('\n'))).toBe(undefined)
   expect(lastContextFromTail([call(300000, 1), boundary('2026-11-14T00:00:00Z'), call(20000, 30000)].join('\n'))).toBe(50002)
-  expect(boundarySince(boundary('2026-11-14T00:00:01Z'), Date.parse('2026-11-14T00:00:00Z'))).toBe(true)
-  expect(boundarySince(boundary('2026-11-13T00:00:00Z'), Date.parse('2026-11-14T00:00:00Z'))).toBe(false)
+  const tail = [boundary('2026-11-13T00:00:00Z'), JSON.stringify({ type: 'system', subtype: 'compact_boundary', timestamp: '2026-11-14T00:00:01Z', compactMetadata: { preTokens: 342853, postTokens: 24864 } }), JSON.stringify({ type: 'system', subtype: 'compact_boundary', isSidechain: true, timestamp: '2026-11-14T00:00:02Z' })].join('\n')
+  const seen = compactionsInTail(tail)
+  expect(seen.map((c) => c.at)).toEqual([Date.parse('2026-11-13T00:00:00Z'), Date.parse('2026-11-14T00:00:01Z')])
+  expect(seen.filter((c) => c.at >= Date.parse('2026-11-14T00:00:00Z')).pop()).toEqual({ at: Date.parse('2026-11-14T00:00:01Z'), preTokens: 342853, postTokens: 24864 })
 })
 
 test('the mark fires once on crossing, then once per further step past the marked size', async () => {
@@ -120,4 +122,15 @@ test('a Stop hook held off for the compaction is passed on as the next prompt', 
   expect(failureRow('x', false, true).includes('The message of the Stop hook that asked to keep going follows as the next prompt.')).toBe(true)
   expect(failureRow('x', true).includes('Your `then` instruction follows as the next prompt.')).toBe(true)
   expect(failureRow('x', false).includes('follow')).toBe(false)
+})
+
+test('the newest Stop hook block since the request is read from the transcript', async () => {
+  const at = (t: string) => `2026-11-17T03:50:${t}Z`
+  const meta = (t: string, text: string) => JSON.stringify({ type: 'user', isMeta: true, timestamp: at(t), message: { role: 'user', content: text } })
+  const att = (t: string, msg: string, hookEvent = 'Stop') => JSON.stringify({ type: 'attachment', timestamp: at(t), attachment: { type: 'hook_blocking_error', hookEvent, blockingError: { blockingError: msg, command: 'x' } } })
+  const since = Date.parse(at('10.000'))
+  const tail = [meta('05.000', 'Stop hook feedback:\nold, before the request'), att('20.000', '[goal] run the checks'), meta('20.001', 'Stop hook feedback:\n[goal] run the checks'), att('21.000', 'not a stop', 'PreToolUse')].join('\n')
+  expect(stopFeedbackFromTail(tail, since)).toBe('[goal] run the checks')
+  expect(stopFeedbackFromTail(meta('30.000', 'Stop hook feedback:\n  keep going  '), since)).toBe('keep going')
+  expect(stopFeedbackFromTail(tail, Date.parse(at('25.000')))).toBe(undefined)
 })
